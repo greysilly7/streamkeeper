@@ -72,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move { refresh_loop(refresh_state).await });
 
     let app = Router::new()
-.route("/", get(index))
+        .route("/", get(index))
         .route("/healthz", get(healthz))
         .route("/status", get(status))
         .route("/manifest.json", get(manifest))
