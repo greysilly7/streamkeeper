@@ -1,5 +1,5 @@
-import { resolveHosts, downloadConfig } from './installer.js';
-import { log, encryptAccountPassword, decryptAccountPassword } from './utils.js';
+import { resolveHosts } from './installer.js';
+import { encryptAccountPassword, decryptAccountPassword } from './utils.js';
 
 function getDefaultUserState(env) {
   return {
@@ -26,35 +26,15 @@ async function getUserState(env, uuid) {
   if (!rec || !rec.preferredHost) return null;
   return rec;
 }
-async function setCachedConfig(env, uuid, config) {
-  await env.AIO_KV.put(`config:${uuid}`, JSON.stringify(config));
-}
-async function refreshConfig(env, record) {
-  try {
-    const password = await getAccountPassword(env, record);
-    const config = await downloadConfig(
-      record.preferredHost,
-      record.uuid,
-      password
-    );
-    const fresh = await getAccount(env, record.uuid);
-    if (!fresh) return null;
-    fresh.cachedConfig = config;
-    fresh.lastConfigRefresh = Date.now();
-    await setCachedConfig(env, record.uuid, config);
-    await putAccount(env, fresh);
-    return config;
-  } catch (err) {
-    log("error", "State", "Config refresh failed", { error: err.message });
-    return null;
-  }
-}
 async function getAccount(env, uuid) {
   const raw = await env.AIO_KV.get(`account:${uuid}`, "json");
   return raw || null;
 }
 async function putAccount(env, account) {
   let record = account;
+  // Configs embed third-party API keys; never store them at rest in KV.
+  // The sealed config lives only in user-held stateless tokens.
+  delete record.cachedConfig;
   if (record.password) {
     record = { ...record, passwordCipher: await encryptAccountPassword(env, record.password) };
     delete record.password;
@@ -99,6 +79,6 @@ async function putHostHealth(env, health) {
   await env.AIO_KV.put("health:hosts", JSON.stringify(health), { expirationTtl: 24 * 60 * 60 });
 }
 
-export { getDefaultUserState, getUserState, setCachedConfig, refreshConfig, getAccount, putAccount, publicAccount, getAccountPassword, listAccounts, deleteAccount, getHostHealth, putHostHealth };
+export { getDefaultUserState, getUserState, getAccount, putAccount, publicAccount, getAccountPassword, listAccounts, deleteAccount, getHostHealth, putHostHealth };
 
 

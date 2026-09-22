@@ -1,7 +1,7 @@
 import { log, corsHeaders, jsonError, parseStremioPath, parseManifestUrl, normalizeUserHost, normalizeUserHosts, sha256Hex, getSigningKey, createJWT, verifyJWT, verifyPassword, authenticateRequest, createStatelessToken, readStatelessToken } from './utils.js';
 import { resolveHosts, downloadConfig, installConfigWithRetry } from './installer.js';
 import { probe, routeRequest } from './routing.js';
-import { getDefaultUserState, getUserState, setCachedConfig, refreshConfig, getAccount, putAccount, publicAccount, getAccountPassword, listAccounts, deleteAccount, getHostHealth, putHostHealth } from './state.js';
+import { getDefaultUserState, getUserState, getAccount, putAccount, publicAccount, getAccountPassword, listAccounts, deleteAccount, getHostHealth, putHostHealth } from './state.js';
 import { adminScript } from './ui/admin.js';
 import { THEME_CSS } from './ui/styles.js';
 import { mascotSmHtml, pageHeadHtml, htmlEsc, confirmModalHtml, toastContainerHtml, newAccountModalHtml, newAccountModalScript, accountCardHtml, statelessSetupPage, statelessManagePage, landingPage, dashboardPage } from './ui/templates.js';
@@ -200,22 +200,13 @@ async function handleRequest(request, env) {
     state.currentHost = parsedUrl.host;
     state.currentUuid = parsedUrl.uuid;
     state.currentEncPwd = parsedUrl.encPwd;
+    // Config stays in memory for this request only; putAccount strips it from KV.
     state.cachedConfig = config;
-    state.lastConfigRefresh = Date.now();
     const record = { ...account, ...state };
-    await setCachedConfig(env, parsedUrl.uuid, config);
     await putAccount(env, record);
     state = record;
   }
   state.password = await getAccountPassword(env, state);
-  const refreshHours = state.cacheRefreshHours || 48;
-  const clampedHours = Math.min(72, Math.max(1, refreshHours));
-  const refreshMs = clampedHours * 60 * 60 * 1e3;
-  if (state.cachedConfig && state.lastConfigRefresh && Date.now() - state.lastConfigRefresh >= refreshMs) {
-    refreshConfig(env, state).catch(
-      (err) => log("error", "Index", "Background refresh failed", { error: err.message })
-    );
-  }
   return await routeRequest(
     request,
     state,
