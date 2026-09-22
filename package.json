@@ -1,0 +1,13 @@
+{
+  "name": "aiostreams-streamkeeper",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check": "node --check streamkeeper.js && node --check src/index.js && node --check src/utils.js && node --check src/installer.js && node --check src/routing.js && node --check src/state.js && node --check src/ui/styles.js && node --check src/ui/admin.js && node --check src/ui/templates.js"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

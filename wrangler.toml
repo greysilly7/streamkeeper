@@ -1,0 +1,21 @@
+name = "aiostreams-streamkeeper"
+main = "streamkeeper.js"
+compatibility_date = "2026-09-13"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+# Set ADMIN_PASSWORD as a secret: wrangler secret put ADMIN_PASSWORD
+# Optional comma-separated override for known AIOStreams origins.
+HOSTS = "https://aiostreams.fortheweak.cloud,https://aio.atbphosting.com,https://aiostreams.12312023.xyz,https://aiostreamsfortheweebsstable.midnightignite.me,https://aiostreams.stremio.ru,https://aiostreams.elfhosted.com,https://aiostreams-stable.forthewizards.uk"
+
+[[routes]]
+pattern = "keeper.greysilly7.xyz"
+custom_domain = true
+
+[[kv_namespaces]]
+binding = "AIO_KV"
+id = "267ea48e6f934dea9c4f11a1768316c2"
+preview_id = "a3ec67b78d5b4484845f11ea33918260"
+
+[triggers]
+crons = ["0 * * * *"]

@@ -1,4 +1,31 @@
-/target
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+out/
+
+# Environment / secrets — never commit real credentials
 .env
+.env.*
+!.env.example
+.envrc
+.dev.vars
+
+# Wrangler local state, cache, and stored credentials
+.wrangler/
+wrangler.toml.local
+wrangler.dev.toml
+
+# Nix / Rust leftovers
+/target
 result
+
+# OS / editor
 .DS_Store
+.idea/
+.vscode/
+
+# Logs
+*.log
+npm-debug.log*
