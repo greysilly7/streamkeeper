@@ -72,9 +72,13 @@ function parseStremioPath(pathname) {
   if (tokenMatch && (tokenMatch[1].startsWith("v1-") || tokenMatch[1].startsWith("v2-"))) {
     return { prefix: "stremio", token: tokenMatch[1] };
   }
-  const match = pathname.match(/\/(stremio)\/([^/]+)\/([^/]+)\//);
+  const aiometadataMatch = pathname.match(/^\/stremio\/([^/]+)\/(manifest\.json|configure)\/?$/);
+  if (aiometadataMatch) {
+    return { prefix: "stremio", source: "aiometadata", uuid: aiometadataMatch[1] };
+  }
+  const match = pathname.match(/^\/stremio\/([^/]+)\/([^/]+)\//);
   if (match) {
-    return { prefix: match[1], uuid: match[2], encryptedPassword: match[3] };
+    return { prefix: "stremio", source: "aiostreams", uuid: match[1], encryptedPassword: match[2] };
   }
   return null;
 }
@@ -83,11 +87,12 @@ function parseManifestUrl(url) {
   try {
     const parsed = new URL(url);
     const parts = parseStremioPath(parsed.pathname);
-    if (!parts) return null;
+    if (!parts || parts.token || !parts.uuid) return null;
     return {
       host: `${parsed.protocol}//${parsed.host}`,
+      source: parts.source || "aiostreams",
       uuid: parts.uuid,
-      encPwd: parts.encryptedPassword
+      encPwd: parts.encryptedPassword || ""
     };
   } catch {
     return null;
@@ -140,7 +145,9 @@ async function readStatelessToken(env, token) {
       // Legacy v1 tokens used uncompressed JSON.
     }
     const payload = JSON.parse(new TextDecoder().decode(plaintext));
-    if (payload.v !== 1 || !payload.u || !payload.e || !payload.p || !payload.h || !Array.isArray(payload.f) || !payload.c) return null;
+    const source = payload.s || parseManifestUrl(payload.m)?.source || "aiostreams";
+    payload.s = source;
+    if (payload.v !== 1 || !payload.u || (source !== "aiometadata" && !payload.e) || !payload.p || !payload.h || !Array.isArray(payload.f) || !payload.c) return null;
     return payload;
   } catch {
     return null;

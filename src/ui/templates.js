@@ -1,4 +1,4 @@
-import { HOSTS } from '../installer.js';
+import { HOSTS, AIOMETADATA_HOSTS } from '../installer.js';
 import { adminScript } from './admin.js';
 import { THEME_CSS } from './styles.js';
 
@@ -198,21 +198,23 @@ function accountCardHtml(acc, idx) {
     </div>
   </div>`;
 }
-function statelessSetupPage() {
-  const hostItems = HOSTS.map((host) => `<div class="instance-row" data-host="${htmlEsc(host)}"><span class="instance-row-mark">−</span><span class="instance-row-host">${htmlEsc(host)}</span><span class="instance-reorder"><button type="button" data-move="up" aria-label="Move ${htmlEsc(host)} up">↑</button><button type="button" data-move="down" aria-label="Move ${htmlEsc(host)} down">↓</button></span><button type="button" class="instance-remove" aria-label="Remove ${htmlEsc(host)}">Remove</button></div>`).join("");
+function statelessSetupPage(source = "aiostreams") {
+  const isAiometadata = source === "aiometadata";
+  const hostList = isAiometadata ? AIOMETADATA_HOSTS : HOSTS;
+  const hostItems = hostList.map((host) => `<div class="instance-row" data-host="${htmlEsc(host)}"><span class="instance-row-mark">−</span><span class="instance-row-host">${htmlEsc(host)}</span><span class="instance-reorder"><button type="button" data-move="up" aria-label="Move ${htmlEsc(host)} up">↑</button><button type="button" data-move="down" aria-label="Move ${htmlEsc(host)} down">↓</button></span><button type="button" class="instance-remove" aria-label="Remove ${htmlEsc(host)}">Remove</button></div>`).join("");
   return `<!doctype html><html lang="en"><head>${pageHeadHtml("Create install link")}</head><body>
   <main class="container setup-page">
     <div class="setup-brand">${mascotSmHtml()}<span>Streamkeeper</span></div>
     <div class="setup-hero">
       <div class="setup-eyebrow"><span class="setup-eyebrow-dot"></span> Resilient addon routing</div>
       <h1 class="gradient-text">Build your Streamkeeper link</h1>
-      <p class="setup-intro">Connect your AIOStreams account once. Streamkeeper keeps a preferred instance ready and fails over to the rest when needed.</p>
-    </div>
+    <p class="setup-intro">Connect your ${isAiometadata ? "AIOMetadata" : "AIOStreams"} account once. Streamkeeper keeps a preferred instance ready and fails over to the rest when needed.</p>
+    ${isAiometadata ? '<div class="setup-warning" role="note"><strong>Experimental AIOMetadata support.</strong> Fallback instances may receive your saved configuration, including provider settings and API keys. Remove any host you do not trust before creating the link.</div>' : ""}
     <form id="setupForm" class="setup-form">
       <section class="glass-card setup-card">
-        <div class="setup-card-heading"><div class="setup-step">01</div><div><h2>Your AIOStreams account</h2><p>Use the manifest URL and password from your existing instance.</p></div></div>
-        <div class="form-group"><label for="manifestUrl">Manifest URL</label><input id="manifestUrl" type="url" required class="form-input" placeholder="https://instance/stremio/uuid/password/manifest.json" autocomplete="url"><span class="field-hint">Your manifest credentials are sealed into the generated link. If you update your AIOStreams configuration later, make a new link — existing links fail over with the configuration they were created with.</span></div>
-        <div class="form-group"><label for="password">AIOStreams password</label><input id="password" type="password" required class="form-input" autocomplete="current-password"><span class="field-hint">Used to verify and restore your configuration on a fallback.</span></div>
+        <div class="setup-card-heading"><div class="setup-step">01</div><div><h2>Your ${isAiometadata ? "AIOMetadata" : "AIOStreams"} account</h2><p>Use the manifest URL and password from your existing instance.</p></div></div>
+        <div class="form-group"><label for="manifestUrl">Manifest URL</label><input id="manifestUrl" type="url" required class="form-input" placeholder="${isAiometadata ? "https://instance/stremio/userUUID/manifest.json" : "https://instance/stremio/uuid/password/manifest.json"}" autocomplete="url"><span class="field-hint">${isAiometadata ? "Paste the generated /stremio/&lt;userUUID&gt;/manifest.json URL, not the instance /configure page. " : ""}Your manifest credentials are sealed into the generated link. If you update your configuration later, make a new link — existing links fail over with the configuration they were created with.</span></div>
+        <div class="form-group"><label for="password">${isAiometadata ? "AIOMetadata" : "AIOStreams"} password</label><input id="password" type="password" required class="form-input" autocomplete="current-password"><span class="field-hint">Used to verify and restore your configuration on a fallback.</span></div>
       </section>
       <section class="glass-card setup-card instance-card">
         <div class="setup-card-heading"><div class="setup-step">02</div><div><h2>Instance pool</h2><p>Choose where Streamkeeper should route requests.</p></div></div>
@@ -259,18 +261,29 @@ function statelessSetupPage() {
     list.addEventListener("click", function(e) { var move = e.target.closest("[data-move]"); if (move) moveInstance(move); else if (e.target.closest(".instance-remove")) e.target.closest(".instance-row").remove(); });
     document.getElementById("setupForm").addEventListener("submit", async function(e) {
       e.preventDefault();
-      var result = document.getElementById("result"); result.textContent = "Creating...";
-      var hosts = Array.from(list.children).map(function(row) { return row.dataset.host; }).filter(Boolean);
-      var response = await fetch("/setup", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ manifestUrl: manifest.value.trim(), password: document.getElementById("password").value, preferredHost: preferred.textContent.trim(), enabledFallbackHosts: hosts })});
-      var data = await response.json();
-      result.textContent = response.ok ? "Install URL:\\n\\n" + data.installUrl + "\\n\\nEdit URL:\\n\\n" + data.manageUrl : (data.error || "Unable to create install link");
+      var result = document.getElementById("result");
+      result.textContent = "Creating...";
+      var submit = e.submitter || document.querySelector('#setupForm button[type="submit"]');
+      if (submit) submit.disabled = true;
+      try {
+        var hosts = Array.from(list.children).map(function(row) { return row.dataset.host; }).filter(Boolean);
+        var response = await fetch("/setup", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ manifestUrl: manifest.value.trim(), password: document.getElementById("password").value, preferredHost: preferred.textContent.trim(), enabledFallbackHosts: hosts })});
+        var data = await response.json();
+        result.textContent = response.ok ? "Install URL:\\n\\n" + data.installUrl + "\\n\\nEdit URL:\\n\\n" + data.manageUrl : (data.error || "Unable to create install link");
+      } catch (err) {
+        result.textContent = "Unable to create install link: " + err.message;
+      } finally {
+        if (submit) submit.disabled = false;
+      }
     });
   })();
   </script></body></html>`;
 }
 function statelessManagePage(tokenString, payload) {
-  const hostItems = payload.f.map((host) => `<div class="instance-row" data-host="${htmlEsc(host)}"><span class="instance-row-mark">−</span><span class="instance-row-host">${htmlEsc(host)}</span><span class="instance-reorder"><button type="button" data-move="up" aria-label="Move ${htmlEsc(host)} up">↑</button><button type="button" data-move="down" aria-label="Move ${htmlEsc(host)} down">↓</button></span><button type="button" class="instance-remove" aria-label="Remove ${htmlEsc(host)}">Remove</button></div>`).join("");
+  const source = payload.s || "aiostreams";
+  const sourceName = source === "aiometadata" ? "AIOMetadata" : "AIOStreams";
   const manifestUrl = payload.m || `${payload.h}/stremio/${payload.u}/${payload.e}/manifest.json`;
+  const hostItems = payload.f.map((host) => `<div class="instance-row" data-host="${htmlEsc(host)}"><span class="instance-row-mark">−</span><span class="instance-row-host">${htmlEsc(host)}</span><span class="instance-reorder"><button type="button" data-move="up" aria-label="Move ${htmlEsc(host)} up">↑</button><button type="button" data-move="down" aria-label="Move ${htmlEsc(host)} down">↓</button></span><button type="button" class="instance-remove" aria-label="Remove ${htmlEsc(host)}">Remove</button></div>`).join("");
   return `<!doctype html><html lang="en"><head>${pageHeadHtml("Edit install link")}</head><body>
   <main class="container setup-page">
     <div class="setup-brand">${mascotSmHtml()}<span>Streamkeeper</span></div>
@@ -280,10 +293,9 @@ function statelessManagePage(tokenString, payload) {
       <p class="setup-intro">Reorder your instances or update the source credentials. Changes create a new link; the old link remains valid.</p>
     </div>
     <form id="manageForm" class="setup-form">
-      <section class="glass-card setup-card">
-        <div class="setup-card-heading"><div class="setup-step">01</div><div><h2>Your AIOStreams account</h2><p>Update the source manifest or leave the password blank to keep it.</p></div></div>
-        <div class="form-group"><label for="manifestUrl">Manifest URL</label><input id="manifestUrl" type="url" required class="form-input" value="${htmlEsc(manifestUrl)}"><span class="field-hint">Remake the link whenever your AIOStreams configuration changes — fallbacks restore the configuration captured when the link was made, not your latest one.</span></div>
-        <div class="form-group"><label for="password">New AIOStreams password</label><input id="password" type="password" class="form-input" placeholder="Leave blank to keep current password"></div>
+        <div class="setup-card-heading"><div class="setup-step">01</div><div><h2>Your ${sourceName} account</h2><p>Update the source manifest or leave the password blank to keep it.</p></div></div>
+        <div class="form-group"><label for="manifestUrl">Manifest URL</label><input id="manifestUrl" type="url" required class="form-input" value="${htmlEsc(manifestUrl)}"><span class="field-hint">Remake the link whenever your ${sourceName} configuration changes — fallbacks restore the configuration captured when the link was made, not your latest one.</span></div>
+        <div class="form-group"><label for="password">New ${sourceName} password</label><input id="password" type="password" class="form-input" placeholder="Leave blank to keep current password"></div>
       </section>
       <section class="glass-card setup-card instance-card">
         <div class="setup-card-heading"><div class="setup-step">02</div><div><h2>Instance pool</h2><p>The list order controls failover priority.</p></div></div>
@@ -400,7 +412,7 @@ function landingPage() {
         </ol>
       </div>
     </div>
-  </div>
+  <a href="/setup?source=aiometadata" aria-label="AIOMetadata beta setup" title="AIOMetadata beta setup" style="position:fixed;right:1rem;bottom:1rem;color:var(--text-secondary);font-size:.75rem;z-index:10;">AIOMetadata beta</a>
 
   <script>
 (function() {

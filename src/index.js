@@ -1,5 +1,5 @@
 import { log, corsHeaders, jsonError, parseStremioPath, parseManifestUrl, normalizeUserHost, normalizeUserHosts, sha256Hex, getSigningKey, createJWT, verifyJWT, verifyPassword, authenticateRequest, createStatelessToken, readStatelessToken } from './utils.js';
-import { resolveHosts, downloadConfig, installConfigWithRetry } from './installer.js';
+import { resolveHosts, downloadConfig, installConfigWithRetry, downloadSourceConfig, installSourceConfig } from './installer.js';
 import { probe, routeRequest } from './routing.js';
 import { getDefaultUserState, getUserState, getAccount, putAccount, publicAccount, getAccountPassword, listAccounts, deleteAccount, getHostHealth, putHostHealth } from './state.js';
 import { adminScript } from './ui/admin.js';
@@ -47,18 +47,17 @@ async function handleStatelessManage(request, env, tokenString) {
   const manifestUrl = String(body.manifestUrl || payload.m).trim();
   const password = String(body.password || payload.p || "");
   const parsed = parseManifestUrl(manifestUrl);
+  const source = parsed?.source || payload.s || "aiostreams";
   const preferredHost = normalizeUserHost(body.preferredHost || (parsed ? parsed.host : ""));
   const fallbackHosts = normalizeUserHosts(body.enabledFallbackHosts || payload.f);
   if (!parsed || !preferredHost || !fallbackHosts.length || !password) return jsonError(400, "Manifest, password, and HTTPS host values are required");
-  // Always re-download so a remake captures the latest config; fall back to
-  // the snapshot only if the host is unreachable, so re-issuing still works offline.
   let config = payload.c;
   try {
-    config = await downloadConfig(parsed.host, parsed.uuid, password);
+    config = await downloadSourceConfig(source, parsed.host, parsed.uuid, password);
   } catch (err) {
     log("error", "Index", "Manage re-issue config refresh failed", { error: err.message });
   }
-  const nextToken = await createStatelessToken(env, { n: payload.n || "", m: manifestUrl, u: parsed.uuid, e: parsed.encPwd, p: password, h: preferredHost, f: fallbackHosts, c: config, r: payload.r || 48 });
+  const nextToken = await createStatelessToken(env, { s: source, n: payload.n || "", m: manifestUrl, u: parsed.uuid, e: parsed.encPwd, p: password, h: preferredHost, f: fallbackHosts, c: config, r: payload.r || 48 });
   const origin = new URL(request.url).origin;
   const nextInstallUrl = `${origin}/stremio/${nextToken}/manifest.json`;
   const nextManageUrl = `${origin}/stremio/${nextToken}/configure`;
@@ -102,7 +101,8 @@ async function handleRequest(request, env) {
     return new Response(null, { headers: corsHeaders() });
   }
   if (url.pathname === "/setup" && request.method === "GET") {
-    return new Response(statelessSetupPage(), { headers: { "content-type": "text/html; charset=utf-8" } });
+    const source = url.searchParams.get("source") === "aiometadata" ? "aiometadata" : "aiostreams";
+    return new Response(statelessSetupPage(source), { headers: { "content-type": "text/html; charset=utf-8" } });
   }
   if (url.pathname === "/setup" && request.method === "POST") {
     const gate = throttleByIp(request, 20, 15 * 60 * 1e3);
@@ -144,15 +144,17 @@ async function handleRequest(request, env) {
     // Ponytail: sticky failover state keyed by token hash; without this every
     // request replays the full failover sequence when the preferred host is down.
     const saved = await env.AIO_KV.get(`st:${tokenHash}`, "json").catch(() => null);
+    const source = token.s || "aiostreams";
     const state = {
       ...getDefaultUserState(env),
+      source,
       uuid: token.u,
-      encryptedPassword: token.e,
+      encryptedPassword: token.e || "",
       password: token.p,
       preferredHost: token.h,
       currentHost: token.h,
       currentUuid: token.u,
-      currentEncPwd: token.e,
+      currentEncPwd: token.e || "",
       cachedConfig: token.c,
       enabledFallbackHosts: token.f,
       cacheRefreshHours: token.r || 48,
@@ -161,8 +163,9 @@ async function handleRequest(request, env) {
     return await routeRequest(
       request,
       state,
-      { uuid: token.u, encryptedPassword: token.e },
+      { uuid: token.u, encryptedPassword: token.e || "" },
       (newState) => env.AIO_KV.put(`st:${tokenHash}`, JSON.stringify({
+        source: newState.source,
         currentHost: newState.currentHost,
         currentUuid: newState.currentUuid,
         currentEncPwd: newState.currentEncPwd,
@@ -365,22 +368,29 @@ async function handleCreateAccount(request, env) {
   }
   const parsed = parseManifestUrl(manifestUrl);
   if (!parsed) {
+    try {
+      if (new URL(manifestUrl).pathname.replace(/\/+$/, "") === "/configure") {
+        return jsonError(400, "Paste the generated AIOMetadata manifest URL, not the /configure page");
+      }
+    } catch {}
     return jsonError(400, "Invalid manifest URL format");
   }
+  const source = parsed.source || "aiostreams";
   const manifestHost = normalizeUserHost(parsed.host);
   const selectedHost = normalizeUserHost(preferredHost || parsed.host);
-  const fallbackHosts = normalizeUserHosts(enabledFallbackHosts || resolveHosts(env));
+  const fallbackHosts = normalizeUserHosts(enabledFallbackHosts || resolveHosts(env, source));
   if (!manifestHost || !selectedHost || !fallbackHosts.length) {
     return jsonError(400, "Preferred and fallback hosts must be valid HTTPS origins");
   }
   let config;
   try {
-    config = await downloadConfig(parsed.host, parsed.uuid, password);
+    config = await downloadSourceConfig(source, parsed.host, parsed.uuid, password);
   } catch (err) {
     log("error", "Index", "Config verification failed", { error: err.message });
     return jsonError(502, "Verification failed");
   }
   const statelessToken = await createStatelessToken(env, {
+    s: source,
     n: nickname,
     m: manifestUrl,
     u: parsed.uuid,

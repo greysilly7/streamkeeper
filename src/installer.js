@@ -9,14 +9,68 @@ const DEFAULT_HOSTS = [
   "https://aiostreams.elfhosted.com",
   "https://aiostreams-stable.forthewizards.uk"
 ];
-function resolveHosts(env) {
-  const override = env && env.HOSTS;
-  if (!override) return [...DEFAULT_HOSTS];
+const AIOMETADATA_HOSTS = [
+  "https://aiometadata.elfhosted.com",
+  "https://aiometadata.fortheweak.cloud",
+  "https://aiometadata.viren070.me",
+  "https://aiometadatafortheweebs.midnightignite.me",
+  "https://aiometadata.forthewizards.uk",
+  "https://aiomd.atbphosting.com",
+  "https://aiometadata.12312023.xyz",
+  "https://aiometadatafortheweak.nhyira.dev",
+  "https://aiometadata.stremio.ru"
+];
+function resolveHosts(env, source = "aiostreams") {
+  const override = env && (source === "aiometadata" ? env.AIOMETADATA_HOSTS : env.HOSTS);
+  if (!override) return source === "aiometadata" ? [...AIOMETADATA_HOSTS] : [...DEFAULT_HOSTS];
   const parsed = override.split(",").map((host) => host.trim()).filter((host) => host.length > 0);
-  return parsed.length > 0 ? parsed : [...DEFAULT_HOSTS];
+  return parsed;
 }
 const HOSTS = DEFAULT_HOSTS;
 var INSTALL_TIMEOUT_MS = 3e4;
+async function downloadAiometadataConfig(host, uuid, password) {
+  const baseUrl = host.replace(/\/$/, "");
+  const response = await fetchWithTimeout(
+    `${baseUrl}/api/config/load/${encodeURIComponent(uuid)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ password })
+    },
+    INSTALL_TIMEOUT_MS,
+    true
+  );
+  const json = await response.json();
+  if (!response.ok || !json.success || !json.config) {
+    throw new Error(json.error || `Failed to download AIOMetadata config: ${response.status}`);
+  }
+  return json.config;
+}
+
+async function installAiometadataConfig(host, config, password, uuid) {
+  const baseUrl = host.replace(/\/$/, "");
+  const response = await fetchWithTimeout(
+    `${baseUrl}/api/config/save`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ config, password, ...(uuid ? { userUUID: uuid } : {}) })
+    },
+    INSTALL_TIMEOUT_MS,
+    true
+  );
+  const json = await response.json();
+  const returnUuid = json.userUUID;
+  if (!response.ok || !json.success || !returnUuid) {
+    throw new Error(json.error || `Failed to install AIOMetadata config: ${response.status}`);
+  }
+  return {
+    uuid: returnUuid,
+    encryptedPassword: "",
+    manifestUrl: `${baseUrl}/stremio/${returnUuid}/manifest.json`
+  };
+}
+
 function handleSmartRetryError(err, config) {
   const errorMsg = (err.message || err.toString()).toLowerCase();
   const serviceMatch = errorMsg.match(/services\.(\d+)\.id:\s*invalid option/);
@@ -121,5 +175,16 @@ async function installConfigWithRetry(host, config, password) {
   }
 }
 
+async function downloadSourceConfig(source, host, uuid, password) {
+  return source === "aiometadata"
+    ? downloadAiometadataConfig(host, uuid, password)
+    : downloadConfig(host, uuid, password);
+}
 
-export { HOSTS, resolveHosts, downloadConfig, installConfigWithRetry };
+async function installSourceConfig(source, host, config, password, uuid) {
+  return source === "aiometadata"
+    ? installAiometadataConfig(host, config, password, uuid)
+    : installConfigWithRetry(host, config, password);
+}
+
+export { HOSTS, AIOMETADATA_HOSTS, resolveHosts, downloadConfig, installConfigWithRetry, downloadSourceConfig, installSourceConfig };

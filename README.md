@@ -1,6 +1,6 @@
 # Streamkeeper
 
-Resilient addon routing for [AIOStreams](https://aiostreams.com): keep one preferred instance ready and fail over to the rest when it goes down. Stateless install links — your configuration is encrypted into the link itself, no server-side account storage.
+Resilient addon routing for [AIOStreams](https://github.com/Viren070/AIOStreams): keep one preferred instance ready and fail over to the rest when it goes down. Stateless install links — your configuration is encrypted into the link itself, no server-side account storage.
 
 Source: <https://github.com/greysilly7/streamkeeper> · License: [GPLv3](LICENSE)
 
