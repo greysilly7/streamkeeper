@@ -50,13 +50,13 @@ async function handleStatelessManage(request, env, tokenString) {
   const preferredHost = normalizeUserHost(body.preferredHost || (parsed ? parsed.host : ""));
   const fallbackHosts = normalizeUserHosts(body.enabledFallbackHosts || payload.f);
   if (!parsed || !preferredHost || !fallbackHosts.length || !password) return jsonError(400, "Manifest, password, and HTTPS host values are required");
+  // Always re-download so a remake captures the latest config; fall back to
+  // the snapshot only if the host is unreachable, so re-issuing still works offline.
   let config = payload.c;
-  if (!config || manifestUrl !== payload.m || parsed.uuid !== payload.u || parsed.encPwd !== payload.e) {
-    try {
-      config = await downloadConfig(parsed.host, parsed.uuid, password);
-    } catch {
-      return jsonError(502, "Verification failed");
-    }
+  try {
+    config = await downloadConfig(parsed.host, parsed.uuid, password);
+  } catch (err) {
+    log("error", "Index", "Manage re-issue config refresh failed", { error: err.message });
   }
   const nextToken = await createStatelessToken(env, { n: payload.n || "", m: manifestUrl, u: parsed.uuid, e: parsed.encPwd, p: password, h: preferredHost, f: fallbackHosts, c: config, r: payload.r || 48 });
   const origin = new URL(request.url).origin;

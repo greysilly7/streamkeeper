@@ -211,7 +211,7 @@ function statelessSetupPage() {
     <form id="setupForm" class="setup-form">
       <section class="glass-card setup-card">
         <div class="setup-card-heading"><div class="setup-step">01</div><div><h2>Your AIOStreams account</h2><p>Use the manifest URL and password from your existing instance.</p></div></div>
-        <div class="form-group"><label for="manifestUrl">Manifest URL</label><input id="manifestUrl" type="url" required class="form-input" placeholder="https://instance/stremio/uuid/password/manifest.json" autocomplete="url"><span class="field-hint">Your manifest credentials are sealed into the generated link.</span></div>
+        <div class="form-group"><label for="manifestUrl">Manifest URL</label><input id="manifestUrl" type="url" required class="form-input" placeholder="https://instance/stremio/uuid/password/manifest.json" autocomplete="url"><span class="field-hint">Your manifest credentials are sealed into the generated link. If you update your AIOStreams configuration later, make a new link — existing links fail over with the configuration they were created with.</span></div>
         <div class="form-group"><label for="password">AIOStreams password</label><input id="password" type="password" required class="form-input" autocomplete="current-password"><span class="field-hint">Used to verify and restore your configuration on a fallback.</span></div>
       </section>
       <section class="glass-card setup-card instance-card">
@@ -229,6 +229,8 @@ function statelessSetupPage() {
       <p id="result" class="setup-result"></p>
     </form>
     <p class="setup-footer">Need an AIOStreams config? <a href="https://duck-tools.pages.dev/quackstart/" target="_blank" rel="noopener noreferrer">Duck Streams</a> can help.</p>
+    <p class="setup-footer">Open source (GPLv3) · <a href="https://github.com/greysilly7/streamkeeper" target="_blank" rel="noopener noreferrer">Source code</a> · <a href="https://torbox.app/subscription?referral=97a1fa98-0aa9-4db5-8a20-f605ef629a2a" target="_blank" rel="noopener noreferrer">TorBox referral</a></p>
+    <p class="setup-footer">Your configuration — including third-party API keys — is sealed into your install link and used only to restore it on fallback hosts; the server does not retain it. Anyone holding the link can use it, so treat it as a secret. Addon traffic passes through this hosted proxy. Verify everything yourself in <a href="https://github.com/greysilly7/streamkeeper" target="_blank" rel="noopener noreferrer">the source</a>.</p>
   </main>
   <script>
   (function() {
@@ -280,7 +282,7 @@ function statelessManagePage(tokenString, payload) {
     <form id="manageForm" class="setup-form">
       <section class="glass-card setup-card">
         <div class="setup-card-heading"><div class="setup-step">01</div><div><h2>Your AIOStreams account</h2><p>Update the source manifest or leave the password blank to keep it.</p></div></div>
-        <div class="form-group"><label for="manifestUrl">Manifest URL</label><input id="manifestUrl" type="url" required class="form-input" value="${htmlEsc(manifestUrl)}"></div>
+        <div class="form-group"><label for="manifestUrl">Manifest URL</label><input id="manifestUrl" type="url" required class="form-input" value="${htmlEsc(manifestUrl)}"><span class="field-hint">Remake the link whenever your AIOStreams configuration changes — fallbacks restore the configuration captured when the link was made, not your latest one.</span></div>
         <div class="form-group"><label for="password">New AIOStreams password</label><input id="password" type="password" class="form-input" placeholder="Leave blank to keep current password"></div>
       </section>
       <section class="glass-card setup-card instance-card">
