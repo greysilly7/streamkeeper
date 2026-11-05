@@ -161,8 +161,7 @@ return AdminConsole;
 
 window.__streamkeeperAdmin = new AdminConsole();
 })();
-<\/script>`;
+</script>`;
 }
-
 
 export { adminScript };

@@ -647,7 +647,7 @@ var COMPONENT_CSS = `.health-badge {
   border: 1px solid rgba(239, 68, 68, 0.3);
 }
 
-.health-badge-unknown {
+.health-badge-unavailable {
   background: rgba(168, 162, 158, 0.1);
   color: var(--text-muted);
   border: 1px solid rgba(168, 162, 158, 0.2);
@@ -1162,6 +1162,5 @@ var PAGE_CSS = `.account-cards-grid {
 }
 `;
 var THEME_CSS = `${TOKENS_CSS}${ANIMATIONS_CSS}${BASE_CSS}${COMPONENT_CSS}${PAGE_CSS}`;
-
 
 export { THEME_CSS };

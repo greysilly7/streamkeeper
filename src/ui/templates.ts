@@ -1,6 +1,7 @@
-import { HOSTS, AIOMETADATA_HOSTS } from '../installer.js';
-import { adminScript } from './admin.js';
-import { THEME_CSS } from './styles.js';
+import { AIOMETADATA_HOSTS, HOSTS } from "../installer";
+import type { AccountRecord, JsonData, Source, StatelessTokenPayload } from "../types";
+import { adminScript } from "./admin";
+import { THEME_CSS } from "./styles";
 
 function mascotSvg() {
   return `<svg viewBox="0 0 48 48" width="1em" height="1em" xmlns="http://www.w3.org/2000/svg">
@@ -12,7 +13,7 @@ function mascotSvg() {
 function mascotSmHtml() {
   return `<span class="mascot mascot-sm">${mascotSvg()}</span>`;
 }
-function pageHeadHtml(title, extraStyles) {
+function pageHeadHtml(title: string, extraStyles = ""): string {
   const extra = extraStyles ? `<style>${extraStyles}</style>` : "";
   return `<meta charset="utf-8">
   <title>${htmlEsc(title)} - Streamkeeper</title>
@@ -23,8 +24,13 @@ function pageHeadHtml(title, extraStyles) {
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Cpath d='M24 4 L44 11 L44 26 C44 38 34 44 24 46 C14 44 6 38 6 26 L6 11 Z' fill='%23ffd166'/%3E%3Cpath d='M16 24 Q20 18 24 24 Q28 30 32 24' stroke='%23e8b844' stroke-width='3' fill='none' stroke-linecap='round'/%3E%3C/svg%3E" type="image/svg+xml">
   <style>${THEME_CSS}</style>${extra}`;
 }
-function htmlEsc(str) {
-  return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+function htmlEsc(str: JsonData | undefined): string {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 function confirmModalHtml() {
   return `
@@ -45,7 +51,14 @@ function confirmModalHtml() {
 function toastContainerHtml() {
   return '<div id="toastContainer" class="toast-container" aria-live="polite"></div>';
 }
-function newAccountModalHtml() {
+function newAccountModalHtml(aiostreamsHosts = HOSTS, aiometadataHosts = AIOMETADATA_HOSTS) {
+  const initialHosts = aiostreamsHosts
+    .map(
+      (host) =>
+        `<label class="checkbox-label"><input type="checkbox" name="newFallbackHost" value="${htmlEsc(host)}" checked> ${htmlEsc(host)}</label>`,
+    )
+    .join("");
+  const pools = JSON.stringify({ aiostreams: aiostreamsHosts, aiometadata: aiometadataHosts }).replace(/</g, "\\u003c");
   return `<div id="addAccountModal" class="modal" style="display:none;">
     <div class="modal-content">
       <div class="modal-header">
@@ -54,24 +67,28 @@ function newAccountModalHtml() {
       </div>
       <form id="addAccountForm">
         <div class="form-group">
+          <label for="newSource">Source</label>
+          <select id="newSource" class="form-input"><option value="aiostreams">AIOStreams</option><option value="aiometadata">AIOMetadata</option></select>
+        </div>
+        <div class="form-group">
           <label for="newNickname">Nickname</label>
           <input type="text" id="newNickname" name="nickname" required class="form-input" placeholder="e.g., My Account, Parents, Friend">
         </div>
         <div class="form-group">
-          <label for="newManifestUrl">AIOStreams Manifest URL</label>
-          <input type="url" id="newManifestUrl" name="manifestUrl" required class="form-input" placeholder="https://host/stremio/uuid/enc/manifest.json">
+          <label for="newManifestUrl">Manifest URL</label>
+          <input type="url" id="newManifestUrl" name="manifestUrl" required class="form-input" placeholder="https://host/stremio/uuid/manifest.json">
         </div>
         <div class="form-group" style="margin-bottom:0;">
-          <label for="newPassword">AIOStreams Password</label>
-          <input type="password" id="newPassword" name="password" required class="form-input" placeholder="Your AIOStreams password">
+          <label for="newPassword">Source password</label>
+          <input type="password" id="newPassword" name="password" required class="form-input" placeholder="Your source password">
         </div>
         <div class="form-group">
-          <label for="newPreferredHost">Preferred Host</label>
-          <select id="newPreferredHost" class="form-input">${HOSTS.map((host) => `<option value="${htmlEsc(host)}">${htmlEsc(host)}</option>`).join("")}</select>
+          <label>Preferred Host</label>
+          <div id="newPreferredHost" class="instance-value">Paste a manifest URL above to detect it</div>
         </div>
         <div class="form-group">
           <label>Fallback Hosts</label>
-          <div class="checkbox-group">${HOSTS.map((host) => `<label class="checkbox-label"><input type="checkbox" name="newFallbackHost" value="${htmlEsc(host)}" checked> ${htmlEsc(host)}</label>`).join("")}</div>
+          <div id="newFallbackHosts" class="checkbox-group">${initialHosts}</div>
         </div>
         <div class="modal-actions">
           <button type="button" class="btn btn-secondary" id="modalCancelBtn">Cancel</button>
@@ -79,7 +96,7 @@ function newAccountModalHtml() {
         </div>
       </form>
     </div>
-  </div>`;
+  </div><script>window.__streamkeeperHostPools = ${pools};</script>`;
 }
 function newAccountModalScript() {
   return `<script>
@@ -91,6 +108,11 @@ function newAccountModalScript() {
   var cancelBtn = document.getElementById("modalCancelBtn");
   var submitBtn = document.getElementById("modalSubmitBtn");
   var toastContainer = document.getElementById("toastContainer");
+  var source = document.getElementById("newSource");
+  var manifest = document.getElementById("newManifestUrl");
+  var preferred = document.getElementById("newPreferredHost");
+  var fallback = document.getElementById("newFallbackHosts");
+  var pools = window.__streamkeeperHostPools || { aiostreams: [], aiometadata: [] };
 
   function showToast(message, type) {
     type = type || "info";
@@ -104,36 +126,47 @@ function newAccountModalScript() {
       setTimeout(function() { if (toast.parentNode) toast.parentNode.removeChild(toast); }, 300);
     }, 3000);
   }
-
   function closeModal() { modal.style.display = "none"; }
-
+  function syncPreferred() {
+    try { preferred.textContent = new URL(manifest.value).origin; }
+    catch { preferred.textContent = "Paste a manifest URL above to detect it"; }
+  }
+  function renderFallbacks() {
+    fallback.innerHTML = "";
+    (pools[source.value] || []).forEach(function(host) {
+      var label = document.createElement("label");
+      label.className = "checkbox-label";
+      var input = document.createElement("input");
+      input.type = "checkbox";
+      input.name = "newFallbackHost";
+      input.value = host;
+      input.checked = true;
+      label.appendChild(input);
+      label.appendChild(document.createTextNode(" " + host));
+      fallback.appendChild(label);
+    });
+  }
   function openModal() {
     modal.style.display = "flex";
     form.reset();
+    source.value = "aiostreams";
+    renderFallbacks();
+    syncPreferred();
     var firstInput = document.getElementById("newNickname");
     if (firstInput) setTimeout(function() { firstInput.focus(); }, 100);
   }
-
-  [closeBtn, cancelBtn].forEach(function(el) {
-    if (el) el.addEventListener("click", closeModal);
-  });
-
-  modal.addEventListener("click", function(e) {
-    if (e.target === modal) closeModal();
-  });
-
-  document.addEventListener("keydown", function(e) {
-    if (e.key === "Escape" && modal.style.display === "flex") closeModal();
-  });
-
+  [closeBtn, cancelBtn].forEach(function(el) { if (el) el.addEventListener("click", closeModal); });
+  modal.addEventListener("click", function(e) { if (e.target === modal) closeModal(); });
+  document.addEventListener("keydown", function(e) { if (e.key === "Escape" && modal.style.display === "flex") closeModal(); });
+  source.addEventListener("change", renderFallbacks);
+  manifest.addEventListener("input", syncPreferred);
   form.addEventListener("submit", function(e) {
     e.preventDefault();
     var nickname = document.getElementById("newNickname").value.trim();
-    var manifestUrl = document.getElementById("newManifestUrl").value.trim();
+    var manifestUrl = manifest.value.trim();
     var password = document.getElementById("newPassword").value;
-    var enabledFallbackHosts = Array.from(document.querySelectorAll('input[name="newFallbackHost"]:checked')).map(function(cb) { return cb.value; });
-    var preferredHost = document.getElementById("newPreferredHost").value;
-
+    var enabledFallbackHosts = Array.from(fallback.querySelectorAll('input[name="newFallbackHost"]:checked')).map(function(cb) { return cb.value; });
+    var preferredHost = preferred.textContent.trim();
     var ok = true;
     [["newNickname", nickname], ["newManifestUrl", manifestUrl], ["newPassword", password]].forEach(function(pair) {
       var el = document.getElementById(pair[0]);
@@ -141,10 +174,8 @@ function newAccountModalScript() {
       if (!pair[1]) { el.classList.add("shake"); ok = false; }
     });
     if (!ok) return;
-
     submitBtn.disabled = true;
     submitBtn.textContent = "Creating...";
-
     fetch("/admin/accounts", {
       method: "POST",
       headers: {
@@ -172,21 +203,21 @@ function newAccountModalScript() {
       submitBtn.textContent = "Create Account";
     });
   });
-
   window.__openNewAccountModal = openModal;
 })();
-<\/script>`;
+</script>`;
 }
-function accountCardHtml(acc, idx) {
+function accountCardHtml(acc: AccountRecord, idx: number): string {
   const nickname = htmlEsc(acc.nickname || `Account ${idx + 1}`);
+  const sourceName = acc.source === "aiometadata" ? "AIOMetadata" : "AIOStreams";
   return `<div class="account-card">
     <div class="account-header">
       <h3>${nickname}</h3>
-      ${!acc.currentHost ? `<span class="health-badge health-badge-unknown">Unknown</span>` : !acc.preferredHost || acc.currentHost === acc.preferredHost ? `<span class="health-badge health-badge-normal">Preferred Host</span>` : `<span class="health-badge health-badge-failover">Failover</span>`}
+      ${!acc.currentHost ? `<span class="health-badge health-badge-unavailable">Unavailable</span>` : !acc.preferredHost || acc.currentHost === acc.preferredHost ? `<span class="health-badge health-badge-normal">Preferred Host</span>` : `<span class="health-badge health-badge-failover">Failover</span>`}
     </div>
     <div class="account-body">
       <div class="install-field">
-        <label>AIOStreams Streamkeeper URL</label>
+        <label>${sourceName} Streamkeeper URL</label>
         <div class="url-with-copy">
           <input type="text" readonly value="${htmlEsc(acc.installUrl)}" class="url-input" id="url-${idx}">
           <button class="copy-btn" data-target="url-${idx}" title="Copy to clipboard">Copy</button>
@@ -198,10 +229,15 @@ function accountCardHtml(acc, idx) {
     </div>
   </div>`;
 }
-function statelessSetupPage(source = "aiostreams") {
+function statelessSetupPage(source: Source = "aiostreams", hosts?: string[]): string {
   const isAiometadata = source === "aiometadata";
-  const hostList = isAiometadata ? AIOMETADATA_HOSTS : HOSTS;
-  const hostItems = hostList.map((host) => `<div class="instance-row" data-host="${htmlEsc(host)}"><span class="instance-row-mark">−</span><span class="instance-row-host">${htmlEsc(host)}</span><span class="instance-reorder"><button type="button" data-move="up" aria-label="Move ${htmlEsc(host)} up">↑</button><button type="button" data-move="down" aria-label="Move ${htmlEsc(host)} down">↓</button></span><button type="button" class="instance-remove" aria-label="Remove ${htmlEsc(host)}">Remove</button></div>`).join("");
+  const hostList = hosts?.length ? hosts : isAiometadata ? AIOMETADATA_HOSTS : HOSTS;
+  const hostItems = hostList
+    .map(
+      (host) =>
+        `<div class="instance-row" data-host="${htmlEsc(host)}"><span class="instance-row-mark">−</span><span class="instance-row-host">${htmlEsc(host)}</span><span class="instance-reorder"><button type="button" data-move="up" aria-label="Move ${htmlEsc(host)} up">↑</button><button type="button" data-move="down" aria-label="Move ${htmlEsc(host)} down">↓</button></span><button type="button" class="instance-remove" aria-label="Remove ${htmlEsc(host)}">Remove</button></div>`,
+    )
+    .join("");
   return `<!doctype html><html lang="en"><head>${pageHeadHtml("Create install link")}</head><body>
   <main class="container setup-page">
     <div class="setup-brand">${mascotSmHtml()}<span>Streamkeeper</span></div>
@@ -230,7 +266,7 @@ function statelessSetupPage(source = "aiostreams") {
       <div class="setup-submit"><button class="btn btn-primary" type="submit">Create encrypted install link <span aria-hidden="true">→</span></button><p class="secure-note"><span aria-hidden="true">◆</span> Your configuration is encrypted before it leaves this page.</p></div>
       <p id="result" class="setup-result"></p>
     </form>
-    <p class="setup-footer">Need an AIOStreams config? <a href="https://duck-tools.pages.dev/quackstart/" target="_blank" rel="noopener noreferrer">Duck Streams</a> can help.</p>
+    <p class="setup-footer">${isAiometadata ? "Need AIOStreams instead?" : "Trying AIOMetadata?"} <a href="${isAiometadata ? "/setup" : "/setup?source=aiometadata"}">${isAiometadata ? "Open AIOStreams setup" : "Open AIOMetadata beta setup"}</a></p>
     <p class="setup-footer">Open source (GPLv3) · <a href="https://github.com/greysilly7/streamkeeper" target="_blank" rel="noopener noreferrer">Source code</a> · <a href="https://torbox.app/subscription?referral=97a1fa98-0aa9-4db5-8a20-f605ef629a2a" target="_blank" rel="noopener noreferrer">TorBox referral</a></p>
     <p class="setup-footer">Your configuration — including third-party API keys — is sealed into your install link and used only to restore it on fallback hosts; the server does not retain it. Anyone holding the link can use it, so treat it as a secret. Addon traffic passes through this hosted proxy. Verify everything yourself in <a href="https://github.com/greysilly7/streamkeeper" target="_blank" rel="noopener noreferrer">the source</a>.</p>
   </main>
@@ -279,11 +315,16 @@ function statelessSetupPage(source = "aiostreams") {
   })();
   </script></body></html>`;
 }
-function statelessManagePage(tokenString, payload) {
+function statelessManagePage(payload: StatelessTokenPayload): string {
   const source = payload.s || "aiostreams";
   const sourceName = source === "aiometadata" ? "AIOMetadata" : "AIOStreams";
   const manifestUrl = payload.m || `${payload.h}/stremio/${payload.u}/${payload.e}/manifest.json`;
-  const hostItems = payload.f.map((host) => `<div class="instance-row" data-host="${htmlEsc(host)}"><span class="instance-row-mark">−</span><span class="instance-row-host">${htmlEsc(host)}</span><span class="instance-reorder"><button type="button" data-move="up" aria-label="Move ${htmlEsc(host)} up">↑</button><button type="button" data-move="down" aria-label="Move ${htmlEsc(host)} down">↓</button></span><button type="button" class="instance-remove" aria-label="Remove ${htmlEsc(host)}">Remove</button></div>`).join("");
+  const hostItems = payload.f
+    .map(
+      (host) =>
+        `<div class="instance-row" data-host="${htmlEsc(host)}"><span class="instance-row-mark">−</span><span class="instance-row-host">${htmlEsc(host)}</span><span class="instance-reorder"><button type="button" data-move="up" aria-label="Move ${htmlEsc(host)} up">↑</button><button type="button" data-move="down" aria-label="Move ${htmlEsc(host)} down">↓</button></span><button type="button" class="instance-remove" aria-label="Remove ${htmlEsc(host)}">Remove</button></div>`,
+    )
+    .join("");
   return `<!doctype html><html lang="en"><head>${pageHeadHtml("Edit install link")}</head><body>
   <main class="container setup-page">
     <div class="setup-brand">${mascotSmHtml()}<span>Streamkeeper</span></div>
@@ -357,6 +398,7 @@ function landingPage() {
         <button id="loginBtn" class="btn btn-primary">Login</button>
         <div id="loginError" class="login-error"></div>
       </div>
+      <a href="/setup?source=aiometadata" class="info-link" style="display:block;margin-top:var(--space-md);">Create an AIOMetadata failover link <small>(beta)</small></a>
     </div>
   </div>
 
@@ -494,11 +536,11 @@ document.addEventListener("keydown", function(e) {
   }
 });
 })();
-<\/script>
+</script>
 </body>
 </html>`;
 }
-function dashboardPage(baseUrl) {
+function dashboardPage(aiostreamsHosts: string[] = HOSTS, aiometadataHosts: string[] = AIOMETADATA_HOSTS): string {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -514,7 +556,7 @@ function dashboardPage(baseUrl) {
       </div>
     </div>
 
-    ${newAccountModalHtml()}
+    ${newAccountModalHtml(aiostreamsHosts, aiometadataHosts)}
 
     <h2 class="accounts-title">Accounts</h2>
 
@@ -528,4 +570,18 @@ function dashboardPage(baseUrl) {
 </body>
 </html>`;
 }
-export { mascotSmHtml, pageHeadHtml, htmlEsc, confirmModalHtml, toastContainerHtml, newAccountModalHtml, newAccountModalScript, accountCardHtml, statelessSetupPage, statelessManagePage, landingPage, dashboardPage };
+
+export {
+  accountCardHtml,
+  confirmModalHtml,
+  dashboardPage,
+  htmlEsc,
+  landingPage,
+  mascotSmHtml,
+  newAccountModalHtml,
+  newAccountModalScript,
+  pageHeadHtml,
+  statelessManagePage,
+  statelessSetupPage,
+  toastContainerHtml,
+};

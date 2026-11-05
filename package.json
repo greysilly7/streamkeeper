@@ -5,9 +5,15 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "check": "node --check streamkeeper.js && node --check src/index.js && node --check src/utils.js && node --check src/installer.js && node --check src/routing.js && node --check src/state.js && node --check src/ui/styles.js && node --check src/ui/admin.js && node --check src/ui/templates.js"
+    "lint": "biome lint . && node scripts/check-type-escapes.mjs",
+    "format:check": "biome ci --linter-enabled=false --assist-enabled=false .",
+    "check": "tsc --noEmit && npm run lint && npm run format:check"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.6.5",
+    "@cloudflare/workers-types": "^5.20261104.1",
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2",
     "wrangler": "^4.0.0"
   }
 }
