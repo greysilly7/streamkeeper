@@ -6,6 +6,9 @@
     "lib": ["ES2022", "DOM"],
     "types": ["@cloudflare/workers-types", "node"],
     "strict": true,
+    "jsx": "react",
+    "jsxFactory": "html",
+    "jsxFragmentFactory": "Fragment",
     "noImplicitReturns": true,
     "noFallthroughCasesInSwitch": true,
     "allowUnreachableCode": false,
@@ -17,6 +20,6 @@
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true
   },
-  "include": ["streamkeeper.ts", "src/**/*.ts"],
+  "include": ["streamkeeper.ts", "src/**/*.ts", "src/**/*.tsx"],
   "exclude": ["node_modules"]
 }

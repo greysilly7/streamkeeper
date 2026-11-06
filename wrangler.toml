@@ -3,6 +3,11 @@ main = "streamkeeper.ts"
 compatibility_date = "2026-09-13"
 compatibility_flags = ["nodejs_compat"]
 
+[[rules]]
+type = "Text"
+globs = ["**/*.css"]
+fallthrough = true
+
 [vars]
 # Set ADMIN_PASSWORD as a secret: wrangler secret put ADMIN_PASSWORD
 # Optional comma-separated override for known AIOStreams origins.

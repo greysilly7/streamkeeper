@@ -4,7 +4,7 @@ import { join } from "node:path";
 function files(root) {
   return readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
     const path = join(root, entry.name);
-    return entry.isDirectory() ? files(path) : path.endsWith(".ts") ? [path] : [];
+    return entry.isDirectory() ? files(path) : path.endsWith(".ts") || path.endsWith(".tsx") ? [path] : [];
   });
 }
 
