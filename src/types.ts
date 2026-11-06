@@ -22,13 +22,8 @@ export interface Config extends JsonObject {
   presets?: PresetConfig[];
 }
 
-export interface Env {
-  AIO_KV: KVNamespace;
-  ADMIN_PASSWORD?: string;
-  PASSWORD_ENCRYPTION_KEY?: string;
-  HOSTS?: string;
-  AIOMETADATA_HOSTS?: string;
-}
+export type Env = Cloudflare.Env;
+
 export interface ParsedStremioPath {
   prefix: "stremio";
   source: Source;

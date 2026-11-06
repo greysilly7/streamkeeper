@@ -1,8 +1,12 @@
-import { installSourceConfig, resolveHosts, updateSourceConfig } from "./installer";
+import { withFailoverLease } from "./failover";
+import { downloadSourceConfig, installSourceConfig, updateSourceConfig } from "./installer";
 import type {
   Env,
   HealthStore,
+  HostHealthEntry,
+  Config,
   JsonData,
+  JsonObject,
   PutState,
   RequestCredentials,
   Source,
@@ -10,32 +14,19 @@ import type {
   UserState,
 } from "./types";
 import { isRecord } from "./types";
-import { corsHeaders, fetchWithTimeout, jsonError, log } from "./utils";
+import { corsHeaders, fetchWithTimeout, jsonError, log, readResponseBody } from "./utils";
 
 const PROBE_TIMEOUT_MS = 2_000;
 const STREAM_TIMEOUT_MS = 7_500;
 const MAX_BODY_BYTES = 10 * 1024 * 1024;
 const CURRENT_VALIDATION_TTL_MS = 10 * 1000;
-type ProvisionResult = SourceInstallResult | { host: string; result: SourceInstallResult };
-const provisionLocks = new Map<string, Promise<ProvisionResult>>();
+const MAX_FAILOVER_ATTEMPTS = 4;
+const MAX_FAILOVER_CANDIDATES = 8;
 
-// ponytail: process-local lock; Durable Objects if cross-isolate serialization is required.
-function withProvisionLock<T extends ProvisionResult>(key: string, operation: () => Promise<T>): Promise<T> {
-  const existing = provisionLocks.get(key);
-  if (existing) return existing as Promise<T>;
-  const promise = Promise.resolve().then(operation);
-  provisionLocks.set(key, promise);
-  const cleanup = (): void => {
-    if (provisionLocks.get(key) === promise) provisionLocks.delete(key);
-  };
-  promise.then(
-    () => setTimeout(cleanup, 1_000),
-    () => setTimeout(cleanup, 1_000),
-  );
-  return promise;
-}
-
+type ProvisionResult = { host: string; result: SourceInstallResult };
 type BodyResult = { tooLarge: boolean; body?: ArrayBuffer };
+
+let healthWriteQueue: Promise<void> | null = null;
 
 async function readBodyWithLimit(request: Request): Promise<BodyResult> {
   const declared = Number(request.headers.get("Content-Length"));
@@ -50,7 +41,7 @@ async function readBodyWithLimit(request: Request): Promise<BodyResult> {
       if (done) break;
       size += value.byteLength;
       if (size > MAX_BODY_BYTES) {
-        await reader.cancel();
+        await reader.cancel().catch(() => undefined);
         return { tooLarge: true };
       }
       chunks.push(value);
@@ -71,7 +62,8 @@ async function readBodyWithLimit(request: Request): Promise<BodyResult> {
 async function isStremioManifest(response: Response): Promise<boolean> {
   if (!response.ok || !(response.headers.get("content-type") || "").includes("application/json")) return false;
   try {
-    const value: JsonData = await response.json();
+    const text = new TextDecoder().decode(await readResponseBody(response));
+    const value: JsonData = JSON.parse(text) as JsonData;
     return (
       isRecord(value) &&
       typeof value.id === "string" &&
@@ -85,8 +77,32 @@ async function isStremioManifest(response: Response): Promise<boolean> {
   }
 }
 
-export async function probe(host: string): Promise<boolean> {
+async function probeAiometadataApi(baseUrl: string): Promise<boolean> {
+  try {
+    const response = await fetchWithTimeout(
+      `${baseUrl}/api/config/load/__streamkeeper_probe__`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ password: "" }),
+      },
+      PROBE_TIMEOUT_MS,
+      true,
+    );
+    if (response.status >= 500 || !(response.headers.get("content-type") || "").includes("application/json"))
+      return false;
+    const text = new TextDecoder().decode(await readResponseBody(response));
+    const value: JsonData = JSON.parse(text) as JsonData;
+    return isRecord(value) && typeof value.success === "boolean";
+  } catch {
+    return false;
+  }
+}
+
+export async function probe(host: string, source: Source = "aiostreams", uuid?: string, encPwd = ""): Promise<boolean> {
   const baseUrl = host.replace(/\/$/, "");
+  if (source === "aiometadata" && uuid) return isSourceValid(baseUrl, source, uuid, encPwd);
+  if (source === "aiometadata") return probeAiometadataApi(baseUrl);
   try {
     const response = await fetchWithTimeout(`${baseUrl}/manifest.json`, { method: "GET" }, PROBE_TIMEOUT_MS, true);
     return isStremioManifest(response);
@@ -119,6 +135,117 @@ function shouldCheckPreferred(state: UserState): boolean {
   return Date.now() - state.lastPreferredCheck >= (state.preferredCooldownMs || 30 * 60 * 1e3);
 }
 
+function canonicalJson(value: JsonData): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const record = value as JsonObject;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key] ?? null)}`)
+    .join(",")}}`;
+}
+
+async function verifyAiometadataConfig(host: string, config: Config, uuid: string, password: string): Promise<void> {
+  const restored = await downloadSourceConfig("aiometadata", host, uuid, password);
+  if (canonicalJson(config) !== canonicalJson(restored)) {
+    throw new Error("AIOMetadata fallback did not preserve the complete configuration");
+  }
+}
+function errorText(error: Error | string): string {
+  return error instanceof Error ? error.message : error;
+}
+
+class StatePersistenceError extends Error {
+  constructor() {
+    super("Unable to persist failover state");
+  }
+}
+
+async function persistState(state: UserState, putState: PutState): Promise<void> {
+  try {
+    await putState(state);
+  } catch (error) {
+    log("error", "Routing", "State persistence failed", {
+      error: errorText(error instanceof Error ? error : String(error)),
+    });
+    throw new StatePersistenceError();
+  }
+}
+
+function isEndpointFailure(response: Response): boolean {
+  return response.status >= 500 || response.status === 408 || response.status === 429;
+}
+
+async function proxyOrFailover(
+  request: Request,
+  host: string,
+  source: Source,
+  uuid: string,
+  encryptedPassword: string,
+  path: string,
+  timeoutMs: number,
+  bodyBuffer: ArrayBuffer | undefined,
+  ctx: ExecutionContext | undefined,
+): Promise<Response> {
+  const response = await proxyRequest(request, host, source, uuid, encryptedPassword, path, timeoutMs, bodyBuffer, ctx);
+  if (!isEndpointFailure(response)) return response;
+  await response.body?.cancel().catch(() => undefined);
+  throw new Error(`Upstream endpoint failed with status ${response.status}`);
+}
+
+export async function updateHostHealth(
+  healthStore: HealthStore | undefined,
+  source: Source,
+  host: string,
+  entry: HostHealthEntry,
+): Promise<void> {
+  if (!healthStore) return;
+  const previous = healthWriteQueue || Promise.resolve();
+  const next = previous
+    .catch(() => undefined)
+    .then(async () => {
+      const health = await healthStore.get();
+      const key = `${source}:${host}`;
+      const old = health[key] || health[host];
+      health[key] = { ...(old || { consecutiveFailures: 0 }), ...entry, source, host };
+      await healthStore.put(health);
+    });
+  healthWriteQueue = next;
+  try {
+    await next;
+  } finally {
+    if (healthWriteQueue === next) healthWriteQueue = null;
+  }
+}
+
+async function safeUpdateHostHealth(
+  healthStore: HealthStore | undefined,
+  source: Source,
+  host: string,
+  entry: HostHealthEntry,
+): Promise<void> {
+  try {
+    await updateHostHealth(healthStore, source, host, entry);
+  } catch (error) {
+    log("warn", "Routing", "Health state update failed", {
+      host,
+      error: errorText(error instanceof Error ? error : String(error)),
+    });
+  }
+}
+
+async function healthSnapshot(healthStore: HealthStore | undefined): Promise<Record<string, HostHealthEntry>> {
+  if (!healthStore) return {};
+  try {
+    return await healthStore.get();
+  } catch (error) {
+    log("warn", "Routing", "Health state read failed", {
+      error: errorText(error instanceof Error ? error : String(error)),
+    });
+    return {};
+  }
+}
+
 export async function routeRequest(
   request: Request,
   state: UserState,
@@ -146,11 +273,13 @@ export async function routeRequest(
       return jsonError(400, "Unable to read request body");
     }
   }
+
   try {
     let currentHost = state.currentHost || state.preferredHost;
     let currentUuid = state.currentUuid || urlCredentials?.uuid || state.uuid;
     let currentEncPwd = state.currentEncPwd || urlCredentials?.encryptedPassword || state.encryptedPassword || "";
     const installationKey = state.installationKey || state.uuid || urlCredentials?.uuid || currentUuid;
+
     if (shouldCheckPreferred(state)) {
       const preferredValid = await isSourceValid(
         state.preferredHost,
@@ -170,9 +299,10 @@ export async function routeRequest(
         state.validatedHost = currentHost;
         state.validatedUuid = currentUuid;
         state.validatedEncPwd = currentEncPwd;
-        await putState(state);
+        await persistState(state, putState);
       }
     }
+
     const validationFresh = Boolean(
       state.lastCurrentValidationAt &&
         Date.now() - state.lastCurrentValidationAt < CURRENT_VALIDATION_TTL_MS &&
@@ -180,35 +310,59 @@ export async function routeRequest(
         state.validatedUuid === currentUuid &&
         state.validatedEncPwd === currentEncPwd,
     );
-    if (validationFresh)
-      return proxyRequest(request, currentHost, source, currentUuid, currentEncPwd, suffix, timeout, bodyBuffer, ctx);
-    if (!validationFresh) {
-      if (!(await isSourceValid(currentHost, source, currentUuid, currentEncPwd))) {
+    if (validationFresh) {
+      try {
+        return await proxyOrFailover(
+          request,
+          currentHost,
+          source,
+          currentUuid,
+          currentEncPwd,
+          suffix,
+          timeout,
+          bodyBuffer,
+          ctx,
+        );
+      } catch (error) {
+        log("warn", "Routing", "Current endpoint failed", {
+          host: currentHost,
+          error: errorText(error instanceof Error ? error : String(error)),
+        });
         state.lastCurrentValidationAt = 0;
-      } else {
-        state.lastCurrentValidationAt = Date.now();
-        state.validatedHost = currentHost;
-        state.validatedUuid = currentUuid;
-        state.validatedEncPwd = currentEncPwd;
-        return proxyRequest(request, currentHost, source, currentUuid, currentEncPwd, suffix, timeout, bodyBuffer, ctx);
+      }
+    } else if (await isSourceValid(currentHost, source, currentUuid, currentEncPwd)) {
+      state.lastCurrentValidationAt = Date.now();
+      state.validatedHost = currentHost;
+      state.validatedUuid = currentUuid;
+      state.validatedEncPwd = currentEncPwd;
+      try {
+        return await proxyOrFailover(
+          request,
+          currentHost,
+          source,
+          currentUuid,
+          currentEncPwd,
+          suffix,
+          timeout,
+          bodyBuffer,
+          ctx,
+        );
+      } catch (error) {
+        log("warn", "Routing", "Current endpoint failed", {
+          host: currentHost,
+          error: errorText(error instanceof Error ? error : String(error)),
+        });
+        state.lastCurrentValidationAt = 0;
       }
     }
+
     const config = state.cachedConfig || null;
-    if (config && (await probe(currentHost))) {
+    if (config && (await probe(currentHost, source))) {
       try {
-        const result =
-          currentHost === state.preferredHost
-            ? await updateSourceConfig(source, currentHost, config, state.password, state.uuid, currentEncPwd)
-            : await withProvisionLock(`${source}:${installationKey}:${currentHost}`, () =>
-                installSourceConfig(
-                  source,
-                  currentHost,
-                  config,
-                  state.password,
-                  source === "aiometadata" ? currentUuid : undefined,
-                ),
-              );
-        state.currentHost = currentHost;
+        const result = await withFailoverLease(env, installationKey, () =>
+          updateSourceConfig(source, currentHost, config, state.password, currentUuid, currentEncPwd),
+        );
+        if (source === "aiometadata") await verifyAiometadataConfig(currentHost, config, result.uuid, state.password);
         state.currentUuid = result.uuid;
         state.currentEncPwd = result.encryptedPassword;
         state.cachedConfig = config;
@@ -216,24 +370,35 @@ export async function routeRequest(
         state.validatedHost = currentHost;
         state.validatedUuid = result.uuid;
         state.validatedEncPwd = result.encryptedPassword;
-        return proxyRequest(
-          request,
-          currentHost,
-          source,
-          result.uuid,
-          result.encryptedPassword,
-          suffix,
-          timeout,
-          bodyBuffer,
-          ctx,
-        );
+        await persistState(state, putState);
+        await invalidateManifestCache(currentHost, source, result.uuid, result.encryptedPassword);
+        try {
+          return await proxyOrFailover(
+            request,
+            currentHost,
+            source,
+            result.uuid,
+            result.encryptedPassword,
+            suffix,
+            timeout,
+            bodyBuffer,
+            ctx,
+          );
+        } catch (error) {
+          log("warn", "Routing", "Repaired endpoint failed", {
+            host: currentHost,
+            error: errorText(error instanceof Error ? error : String(error)),
+          });
+        }
       } catch (error) {
+        if (error instanceof StatePersistenceError) return jsonError(503, error.message);
         log("error", "Routing", "Current host config repair failed", {
           host: currentHost,
-          error: error instanceof Error ? error.message : String(error),
+          error: errorText(error instanceof Error ? error : String(error)),
         });
       }
     }
+
     const cachedConfig = state.cachedConfig || null;
     if (!cachedConfig)
       return jsonError(
@@ -241,74 +406,108 @@ export async function routeRequest(
         "Current host down and no cached config for failover",
         "Could not download or cache a config for this user",
       );
-    const enabledHosts = state.enabledFallbackHosts.length ? state.enabledFallbackHosts : resolveHosts(env, source);
+    const enabledHosts = state.enabledFallbackHosts;
     if (!enabledHosts.length) return jsonError(502, "All fallback hosts are disabled");
-    const candidates = enabledHosts.filter((host) => host !== currentHost && host !== state.preferredHost);
-    const health = healthStore ? await healthStore.get() : {};
-    const now = Date.now();
-    const healthyCandidates = candidates.filter((host) => {
-      const entry = health[`${source}:${host}`] || health[host];
-      return entry?.status === "healthy" && now - entry.checkedAt < 5 * 60 * 1e3;
-    });
-    let orderedCandidates = healthyCandidates;
-    if (!orderedCandidates.length) {
-      const probedCandidates = await Promise.all(candidates.map(async (host) => ({ host, online: await probe(host) })));
-      for (const candidate of probedCandidates) {
-        const key = `${source}:${candidate.host}`;
-        const previous = health[key] || health[candidate.host];
-        health[key] = {
-          ...(previous || { consecutiveFailures: 0 }),
-          status: candidate.online ? "healthy" : "unhealthy",
-          checkedAt: Date.now(),
-          consecutiveFailures: candidate.online ? 0 : (previous?.consecutiveFailures || 0) + 1,
-        };
-      }
-      if (healthStore) await healthStore.put(health);
-      orderedCandidates = probedCandidates.filter((candidate) => candidate.online).map((candidate) => candidate.host);
+    const candidates = enabledHosts
+      .filter((host) => host !== currentHost && host !== state.preferredHost)
+      .slice(0, MAX_FAILOVER_CANDIDATES);
+    if (!candidates.length) return jsonError(502, "All instances unavailable", "No fallback host is reachable");
+
+    const health = await healthSnapshot(healthStore);
+    const probedCandidates = await Promise.all(
+      candidates.map(async (host) => {
+        const started = Date.now();
+        const online = await probe(host, source);
+        return { host, online, latencyMs: Date.now() - started };
+      }),
+    );
+    for (const candidate of probedCandidates) {
+      const previous = health[`${source}:${candidate.host}`] || health[candidate.host];
+      const entry: HostHealthEntry = {
+        ...(previous || { consecutiveFailures: 0 }),
+        status: candidate.online ? "healthy" : "unhealthy",
+        checkedAt: Date.now(),
+        latencyMs: candidate.latencyMs,
+        source,
+        host: candidate.host,
+        consecutiveFailures: candidate.online ? 0 : (previous?.consecutiveFailures || 0) + 1,
+      };
+      health[`${source}:${candidate.host}`] = entry;
+      await safeUpdateHostHealth(healthStore, source, candidate.host, entry);
     }
+    const healthyCandidates = probedCandidates.filter((candidate) => candidate.online);
+    const orderedCandidates =
+      healthyCandidates.length > 0
+        ? [...healthyCandidates, ...probedCandidates.filter((candidate) => !candidate.online)].slice(
+            0,
+            MAX_FAILOVER_ATTEMPTS,
+          )
+        : [];
     if (!orderedCandidates.length) return jsonError(502, "All instances unavailable", "No fallback host is reachable");
-    const fallbackResult = await withProvisionLock(`${source}:${installationKey}`, async () => {
-      for (const host of orderedCandidates) {
-        try {
-          const result =
-            source === "aiometadata" && (await isSourceValid(host, source, state.uuid, ""))
-              ? { uuid: state.uuid, encryptedPassword: "", manifestUrl: `${host}/stremio/${state.uuid}/manifest.json` }
-              : await installSourceConfig(
-                  source,
-                  host,
-                  cachedConfig,
-                  state.password,
-                  source === "aiometadata" ? state.uuid : undefined,
-                );
-          if (!(await isSourceValid(host, source, result.uuid, result.encryptedPassword)))
-            throw new Error("Fallback manifest validation failed");
-          const key = `${source}:${host}`;
-          health[key] = {
-            ...(health[key] || health[host] || { consecutiveFailures: 0 }),
-            status: "healthy",
-            checkedAt: Date.now(),
-            consecutiveFailures: 0,
-          };
-          if (healthStore) await healthStore.put(health);
-          return { host, result };
-        } catch (error) {
-          const key = `${source}:${host}`;
-          const previous = health[key] || health[host];
-          health[key] = {
-            ...(previous || { consecutiveFailures: 0 }),
-            status: "unhealthy",
-            checkedAt: Date.now(),
-            consecutiveFailures: (previous?.consecutiveFailures || 0) + 1,
-          };
-          if (healthStore) await healthStore.put(health);
-          log("error", "Routing", "Failover attempt failed", {
-            host,
-            error: error instanceof Error ? error.message : String(error),
-          });
+
+    let fallbackResult: ProvisionResult;
+    try {
+      fallbackResult = await withFailoverLease(env, installationKey, async () => {
+        for (const candidate of orderedCandidates) {
+          const host = candidate.host;
+          try {
+            const result =
+              source === "aiometadata" && (await isSourceValid(host, source, state.uuid, ""))
+                ? {
+                    uuid: state.uuid,
+                    encryptedPassword: "",
+                    manifestUrl: `${host}/stremio/${state.uuid}/manifest.json`,
+                  }
+                : await installSourceConfig(
+                    source,
+                    host,
+                    cachedConfig,
+                    state.password,
+                    source === "aiometadata" ? state.uuid : undefined,
+                  );
+            if (source === "aiometadata")
+              await verifyAiometadataConfig(host, cachedConfig, result.uuid, state.password);
+            const key = `${source}:${host}`;
+            const previous = health[key] || health[host];
+            const entry: HostHealthEntry = {
+              ...(previous || { consecutiveFailures: 0 }),
+              status: "healthy",
+              checkedAt: Date.now(),
+              consecutiveFailures: 0,
+              source,
+              host,
+            };
+            health[key] = entry;
+            await safeUpdateHostHealth(healthStore, source, host, entry);
+            return { host, result };
+          } catch (error) {
+            const key = `${source}:${host}`;
+            const previous = health[key] || health[host];
+            const entry: HostHealthEntry = {
+              ...(previous || { consecutiveFailures: 0 }),
+              status: "unhealthy",
+              checkedAt: Date.now(),
+              consecutiveFailures: (previous?.consecutiveFailures || 0) + 1,
+              source,
+              host,
+            };
+            health[key] = entry;
+            await safeUpdateHostHealth(healthStore, source, host, entry);
+            log("error", "Routing", "Failover attempt failed", {
+              host,
+              error: errorText(error instanceof Error ? error : String(error)),
+            });
+          }
         }
-      }
-      throw new Error("Failover exhausted all reachable hosts");
-    });
+        throw new Error("Failover exhausted all reachable hosts");
+      });
+    } catch (error) {
+      log("error", "Routing", "Failover provisioning failed", {
+        error: errorText(error instanceof Error ? error : String(error)),
+      });
+      return jsonError(502, "All instances unavailable");
+    }
+
     state.failoverCount += 1;
     state.lastFailoverAt = Date.now();
     state.lastFailoverHost = state.currentHost;
@@ -319,20 +518,92 @@ export async function routeRequest(
     state.validatedHost = state.currentHost;
     state.validatedUuid = state.currentUuid;
     state.validatedEncPwd = state.currentEncPwd;
-    return proxyRequest(
-      request,
-      state.currentHost,
-      source,
-      state.currentUuid,
-      state.currentEncPwd,
-      suffix,
-      timeout,
-      bodyBuffer,
-      ctx,
-    );
+    try {
+      await persistState(state, putState);
+    } catch (error) {
+      if (error instanceof StatePersistenceError) return jsonError(503, error.message);
+      throw error;
+    }
+    try {
+      return await proxyOrFailover(
+        request,
+        state.currentHost,
+        source,
+        state.currentUuid,
+        state.currentEncPwd,
+        suffix,
+        timeout,
+        bodyBuffer,
+        ctx,
+      );
+    } catch (error) {
+      log("error", "Routing", "Fallback endpoint failed", {
+        host: state.currentHost,
+        error: errorText(error instanceof Error ? error : String(error)),
+      });
+      return jsonError(502, "All instances unavailable");
+    }
   } catch (error) {
-    log("error", "Routing", "Route failed", { error: error instanceof Error ? error.message : String(error) });
+    if (error instanceof StatePersistenceError) return jsonError(503, error.message);
+    log("error", "Routing", "Route failed", { error: errorText(error instanceof Error ? error : String(error)) });
     return jsonError(502, "All instances unavailable");
+  }
+}
+
+async function invalidateManifestCache(
+  host: string,
+  source: Source,
+  uuid: string,
+  encryptedPassword: string,
+): Promise<void> {
+  if (source === "aiometadata") return;
+  const target = `${host.replace(/\/$/, "")}${sourcePrefix(source, uuid, encryptedPassword)}/manifest.json`;
+  try {
+    await caches.default.delete(new Request(target, { method: "GET" }));
+  } catch (error) {
+    log("warn", "Routing", "Manifest cache invalidation failed", {
+      host,
+      error: errorText(error instanceof Error ? error : String(error)),
+    });
+  }
+}
+
+async function fetchWithBodyTimeout(targetUrl: string, options: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(targetUrl, { ...options, signal: controller.signal });
+    if (!response.body) {
+      clearTimeout(timer);
+      return response;
+    }
+    const reader = response.body.getReader();
+    const body = new ReadableStream<Uint8Array>({
+      async pull(streamController) {
+        try {
+          const next = await reader.read();
+          if (next.done) {
+            clearTimeout(timer);
+            streamController.close();
+          } else {
+            streamController.enqueue(next.value);
+          }
+        } catch (error) {
+          clearTimeout(timer);
+          streamController.error(error);
+        }
+      },
+      async cancel(reason) {
+        clearTimeout(timer);
+        await reader.cancel(reason);
+      },
+    });
+    return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
+  } catch (error) {
+    clearTimeout(timer);
+    if (error instanceof DOMException && error.name === "AbortError")
+      throw new Error(`Upstream request timed out after ${timeoutMs}ms`);
+    throw error;
   }
 }
 
@@ -375,14 +646,14 @@ async function proxyRequest(
     }
     const fetchOptions: RequestInit = { method, redirect: "manual", headers };
     if (body !== undefined) fetchOptions.body = body as BodyInit;
-    const response = await fetchWithTimeout(targetUrl, fetchOptions, timeoutMs);
+    const response = await fetchWithBodyTimeout(targetUrl, fetchOptions, timeoutMs);
     log("info", "Routing", "Upstream response", { host: baseUrl, path, status: response.status });
     const responseHeaders = new Headers(response.headers);
     responseHeaders.delete("content-encoding");
     responseHeaders.delete("content-length");
     for (const [key, value] of Object.entries(corsHeaders())) responseHeaders.set(key, value);
     if (cacheManifest && response.status === 200) {
-      const buffer = await response.arrayBuffer();
+      const buffer = await readResponseBody(response);
       responseHeaders.set("cache-control", "public, s-maxage=900, max-age=900");
       const toReturn = new Response(buffer, { status: response.status, headers: responseHeaders });
       const cacheWrite = caches.default.put(cacheKey, toReturn.clone()).catch((error: Error) => {
@@ -397,7 +668,7 @@ async function proxyRequest(
     log("error", "Routing", "Upstream request failed", {
       host: baseUrl,
       path,
-      error: error instanceof Error ? error.message : String(error),
+      error: errorText(error instanceof Error ? error : String(error)),
     });
     throw error;
   }

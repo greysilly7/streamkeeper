@@ -1,7 +1,7 @@
 {
   "$schema": "https://biomejs.dev/schemas/2.6.5/schema.json",
   "files": {
-    "includes": ["**/*.ts", "**/*.tsx", "!**/.wrangler"]
+    "includes": ["**/*.ts", "**/*.tsx", "**/*.css", "!**/worker-configuration.d.ts", "!**/.wrangler"]
   },
   "formatter": {
     "enabled": true,
@@ -12,6 +12,9 @@
     "enabled": true,
     "rules": {
       "preset": "recommended",
+      "complexity": {
+        "noImportantStyles": "off"
+      },
       "suspicious": {
         "noExplicitAny": "error"
       }

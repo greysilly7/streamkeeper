@@ -129,14 +129,6 @@ export function LandingPage(): Html {
               </ol>
             </div>
           </div>
-          <a
-            href="/setup?source=aiometadata"
-            aria-label="AIOMetadata beta setup"
-            title="AIOMetadata beta setup"
-            style="position:fixed;right:1rem;bottom:1rem;color:var(--text-secondary);font-size:.75rem;z-index:10;"
-          >
-            AIOMetadata beta
-          </a>
         </div>
         {rawHtml(landingScript())}
       </body>

@@ -3,6 +3,29 @@ main = "streamkeeper.ts"
 compatibility_date = "2026-09-13"
 compatibility_flags = ["nodejs_compat"]
 
+[[durable_objects.bindings]]
+name = "FAILOVER_COORDINATOR"
+class_name = "FailoverCoordinator"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["FailoverCoordinator"]
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+redact_query_string = true
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 0.1
+persist = true
+
 [[rules]]
 type = "Text"
 globs = ["**/*.css"]
@@ -12,6 +35,8 @@ fallthrough = true
 # Set ADMIN_PASSWORD as a secret: wrangler secret put ADMIN_PASSWORD
 # Optional comma-separated override for known AIOStreams origins.
 HOSTS = "https://aiostreams.fortheweak.cloud,https://aio.atbphosting.com,https://aiostreams.12312023.xyz,https://aiostreamsfortheweebsstable.midnightignite.me,https://aiostreams.stremio.ru,https://aiostreams.elfhosted.com,https://aiostreams-stable.forthewizards.uk"
+# Optional comma-separated override for AIOMetadata fallback origins.
+AIOMETADATA_HOSTS = ""
 
 [[routes]]
 pattern = "keeper.greysilly7.xyz"

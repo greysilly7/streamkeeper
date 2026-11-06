@@ -1,5 +1,5 @@
 import { downloadSourceConfig, resolveHosts, verifySourceHosts } from "./installer";
-import { probe, routeRequest } from "./routing";
+import { probe, routeRequest, updateHostHealth } from "./routing";
 import {
   deleteAccount,
   getAccount,
@@ -12,15 +12,26 @@ import {
   putAccount,
   putHostHealth,
 } from "./state";
-import type { AccountRecord, Config, Env, HostHealthEntry, JsonData, JsonObject, Source, UserState } from "./types";
-import { isRecord } from "./types";
-import { accountCardHtml, dashboardPage, statelessManagePage, statelessSetupPage } from "./ui/templates";
+import type {
+  AccountRecord,
+  Config,
+  Env,
+  HealthStore,
+  HostHealth,
+  HostHealthEntry,
+  JsonData,
+  JsonObject,
+  JwtPayload,
+  Source,
+  UserState,
+} from "./types";
+import { errorMessage, isRecord } from "./types";
+import { accountCardHtml, dashboardPage, statelessManagePage, statelessSetupPage } from "./ui/render";
 import {
   authenticateRequest,
   corsHeaders,
   createJWT,
   createStatelessToken,
-  errorMessage,
   getSigningKey,
   jsonError,
   log,
@@ -29,41 +40,148 @@ import {
   parseManifestUrl,
   parseStremioPath,
   readStatelessToken,
+  revokeJWTSession,
+  revokeStatelessToken,
+  revokeTokenLineage,
   sha256Hex,
-  verifyJWT,
   verifyPassword,
 } from "./utils";
 
-const requestAttempts = new Map<string, { count: number; startedAt: number }>();
+export { FailoverCoordinator } from "./failover";
+
 const THROTTLE_LIMIT = 5;
 const THROTTLE_WINDOW_MS = 15 * 60 * 1e3;
-const THROTTLE_MAX_ENTRIES = 5000;
-function throttleByIp(
-  request: Request,
-  limit = THROTTLE_LIMIT,
-  windowMs = THROTTLE_WINDOW_MS,
-): { blocked: boolean; ip: string } {
-  const ip =
+
+function requestIp(request: Request): string {
+  return (
     request.headers.get("CF-Connecting-IP") ||
     request.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() ||
-    "unidentified";
+    "unidentified"
+  );
+}
+
+async function throttleByIp(
+  request: Request,
+  env: Env,
+  limit = THROTTLE_LIMIT,
+  windowMs = THROTTLE_WINDOW_MS,
+): Promise<{ blocked: boolean; ip: string }> {
+  const ip = requestIp(request);
+  const key = `throttle:${await sha256Hex(ip)}`;
   const now = Date.now();
-  if (requestAttempts.size > THROTTLE_MAX_ENTRIES) {
-    for (const [key, value] of requestAttempts) {
-      if (now - value.startedAt >= windowMs) requestAttempts.delete(key);
-    }
-    if (requestAttempts.size > THROTTLE_MAX_ENTRIES) requestAttempts.clear();
-  }
-  const entry = requestAttempts.get(ip);
-  if (entry && now - entry.startedAt < windowMs && entry.count >= limit) {
+  try {
+    const saved = await env.AIO_KV.get<JsonData>(key, "json");
+    const record =
+      isRecord(saved) &&
+      typeof saved.count === "number" &&
+      Number.isSafeInteger(saved.count) &&
+      saved.count >= 0 &&
+      typeof saved.resetAt === "number" &&
+      Number.isFinite(saved.resetAt)
+        ? { count: saved.count, resetAt: saved.resetAt }
+        : null;
+    if (record && record.resetAt > now && record.count >= limit) return { blocked: true, ip };
+    const next =
+      record && record.resetAt > now
+        ? { count: record.count + 1, resetAt: record.resetAt }
+        : { count: 1, resetAt: now + windowMs };
+    await env.AIO_KV.put(key, JSON.stringify(next), {
+      expirationTtl: Math.max(60, Math.ceil((next.resetAt - now) / 1e3)),
+    });
+    return { blocked: false, ip };
+  } catch {
     return { blocked: true, ip };
   }
-  if (!entry || now - entry.startedAt >= windowMs) {
-    requestAttempts.set(ip, { startedAt: now, count: 0 });
+}
+
+async function resetThrottle(env: Env, ip: string): Promise<void> {
+  await env.AIO_KV.delete(`throttle:${await sha256Hex(ip)}`);
+}
+
+const MAX_PUBLIC_BODY_BYTES = 1 * 1024 * 1024;
+
+type LimitedJsonBody = { body?: JsonObject; tooLarge: boolean };
+
+async function readJsonObjectWithLimit(request: Request): Promise<LimitedJsonBody> {
+  const declared = Number(request.headers.get("Content-Length"));
+  if (Number.isFinite(declared) && declared >= 0 && declared > MAX_PUBLIC_BODY_BYTES) return { tooLarge: true };
+  if (!request.body) return { tooLarge: false };
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_PUBLIC_BODY_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        return { tooLarge: true };
+      }
+      chunks.push(value);
+    }
+  } catch {
+    await reader.cancel().catch(() => undefined);
+    return { tooLarge: false };
   }
-  const current = requestAttempts.get(ip);
-  if (current) current.count++;
-  return { blocked: false, ip };
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    const value: JsonData = JSON.parse(new TextDecoder().decode(bytes));
+    return isRecord(value) ? { tooLarge: false, body: value } : { tooLarge: false };
+  } catch {
+    return { tooLarge: false };
+  }
+}
+
+function parsePersistedRoutingState(value: JsonData | null): Partial<UserState> {
+  if (!isRecord(value)) return {};
+  const result: Partial<UserState> = {};
+  const currentHost = typeof value.currentHost === "string" ? normalizeUserHost(value.currentHost) : null;
+  if (currentHost) result.currentHost = currentHost;
+  if (typeof value.currentUuid === "string" && value.currentUuid.length > 0 && value.currentUuid.length <= 4096) {
+    result.currentUuid = value.currentUuid;
+  }
+  if (typeof value.currentEncPwd === "string" && value.currentEncPwd.length <= 4096) {
+    result.currentEncPwd = value.currentEncPwd;
+  }
+  const validatedHost = typeof value.validatedHost === "string" ? normalizeUserHost(value.validatedHost) : null;
+  if (validatedHost) result.validatedHost = validatedHost;
+  if (typeof value.validatedUuid === "string" && value.validatedUuid.length > 0 && value.validatedUuid.length <= 4096) {
+    result.validatedUuid = value.validatedUuid;
+  }
+  if (typeof value.validatedEncPwd === "string" && value.validatedEncPwd.length <= 4096) {
+    result.validatedEncPwd = value.validatedEncPwd;
+  }
+  for (const key of ["lastPreferredCheck", "lastCurrentValidationAt", "lastFailoverAt"] as const) {
+    if (typeof value[key] === "number" && Number.isFinite(value[key]) && value[key] >= 0) result[key] = value[key];
+  }
+  if (
+    typeof value.failoverCount === "number" &&
+    Number.isSafeInteger(value.failoverCount) &&
+    value.failoverCount >= 0
+  ) {
+    result.failoverCount = value.failoverCount;
+  }
+  if (typeof value.lastFailoverHost === "string") {
+    const lastFailoverHost = normalizeUserHost(value.lastFailoverHost);
+    if (lastFailoverHost) result.lastFailoverHost = lastFailoverHost;
+  }
+  if (Array.isArray(value.enabledFallbackHosts))
+    result.enabledFallbackHosts = normalizeUserHosts(value.enabledFallbackHosts);
+  if (
+    typeof value.cacheRefreshHours === "number" &&
+    Number.isFinite(value.cacheRefreshHours) &&
+    value.cacheRefreshHours >= 1 &&
+    value.cacheRefreshHours <= 72
+  ) {
+    result.cacheRefreshHours = value.cacheRefreshHours;
+  }
+  return result;
 }
 
 async function handleStatelessManage(request: Request, env: Env, tokenString: string): Promise<Response> {
@@ -73,22 +191,23 @@ async function handleStatelessManage(request: Request, env: Env, tokenString: st
     return new Response(statelessManagePage(payload), { headers: { "content-type": "text/html; charset=utf-8" } });
   }
   if (request.method !== "POST") return jsonError(405, "Method not allowed");
-  const gate = throttleByIp(request, 20, 15 * 60 * 1e3);
-  if (gate.blocked) return jsonError(429, "Too many requests");
-  let body: JsonObject;
-  try {
-    const parsedBody: JsonData = await request.json();
-    if (!isRecord(parsedBody)) return jsonError(400, "Invalid JSON body");
-    body = parsedBody;
-  } catch {
-    return jsonError(400, "Invalid JSON body");
-  }
-  const manifestUrl = String(body.manifestUrl || payload.m).trim();
-  const password = String(body.password || payload.p || "");
+  const parsedResult = await readJsonObjectWithLimit(request);
+  if (parsedResult.tooLarge) return jsonError(413, "Request body too large");
+  const body = parsedResult.body;
+  if (!body) return jsonError(400, "Invalid JSON body");
+  const manifestUrl = typeof body.manifestUrl === "string" ? body.manifestUrl.trim() : payload.m || "";
+  const password = typeof body.password === "string" && body.password ? body.password : payload.p || "";
   const parsed = parseManifestUrl(manifestUrl);
   const source: Source = parsed?.source || payload.s || "aiostreams";
-  const preferredHost = normalizeUserHost(parsed ? parsed.host : "");
-  const fallbackHosts = normalizeUserHosts(body.enabledFallbackHosts || payload.f);
+  const preferredHost = normalizeUserHost(parsed?.host);
+  const submittedFallbacks = body.enabledFallbackHosts;
+  const fallbackInput =
+    submittedFallbacks !== undefined
+      ? submittedFallbacks
+      : source === payload.s
+        ? payload.f
+        : resolveHosts(env, source);
+  const fallbackHosts = normalizeUserHosts(fallbackInput);
   if (!parsed || !preferredHost || !fallbackHosts.length || !password)
     return jsonError(400, "Manifest, password, and HTTPS host values are required");
   try {
@@ -107,7 +226,10 @@ async function handleStatelessManage(request: Request, env: Env, tokenString: st
     log("error", "Index", "Manage re-issue config refresh failed", {
       error: errorMessage(err instanceof Error ? err : String(err)),
     });
+    if (source !== payload.s) return jsonError(502, "Unable to download source config");
   }
+  const tokenExpiry = "exp" in payload && typeof payload.exp === "number" ? payload.exp : undefined;
+  const tokenLineage = "l" in payload && typeof payload.l === "string" ? payload.l : undefined;
   const nextToken = await createStatelessToken(env, {
     s: source,
     n: payload.n || "",
@@ -119,6 +241,7 @@ async function handleStatelessManage(request: Request, env: Env, tokenString: st
     f: fallbackHosts,
     c: config,
     r: payload.r || 48,
+    ...(tokenLineage ? { l: tokenLineage } : {}),
   });
   const origin = new URL(request.url).origin;
   const nextInstallUrl = `${origin}/stremio/${nextToken}/manifest.json`;
@@ -127,26 +250,31 @@ async function handleStatelessManage(request: Request, env: Env, tokenString: st
   const existingRecord = await env.AIO_KV.get<AccountRecord>(`account:${oldHash}`, "json").catch(() => null);
   const nextHash = await sha256Hex(nextToken);
   if (existingRecord) {
-    await Promise.all([
-      env.AIO_KV.delete(`account:${oldHash}`),
-      env.AIO_KV.delete(`st:${oldHash}`),
-      env.AIO_KV.put(
-        `account:${nextHash}`,
-        JSON.stringify({
-          uuid: nextHash,
-          token: nextToken,
-          nickname: existingRecord.nickname || payload.n || "Streamkeeper install",
-          source,
-          preferredHost,
-          currentHost: preferredHost,
-          installUrl: nextInstallUrl,
-          manageUrl: nextManageUrl,
-          failoverCount: 0,
-          createdAt: existingRecord.createdAt || Date.now(),
-        }),
-      ),
-    ]);
+    await env.AIO_KV.put(
+      `account:${nextHash}`,
+      JSON.stringify({
+        uuid: nextHash,
+        token: nextToken,
+        nickname: existingRecord.nickname || payload.n || "Streamkeeper install",
+        source,
+        preferredHost,
+        currentHost: preferredHost,
+        installUrl: nextInstallUrl,
+        manageUrl: nextManageUrl,
+        failoverCount: 0,
+        createdAt: existingRecord.createdAt || Date.now(),
+      }),
+    );
   }
+  try {
+    await revokeStatelessToken(env, tokenString, tokenExpiry);
+  } catch (error) {
+    log("error", "Index", "Stateless token rotation revocation failed", {
+      error: errorMessage(error instanceof Error ? error : String(error)),
+    });
+    return jsonError(503, "Unable to revoke previous install token");
+  }
+  await Promise.all([env.AIO_KV.delete(`account:${oldHash}`), env.AIO_KV.delete(`st:${oldHash}`)]);
   return new Response(JSON.stringify({ installUrl: nextInstallUrl, manageUrl: nextManageUrl }), {
     headers: { "content-type": "application/json", ...corsHeaders() },
   });
@@ -159,6 +287,17 @@ function parseCookie(request: Request, name: string): string | null {
     if (trimmed.startsWith(`${name}=`)) return trimmed.slice(name.length + 1);
   }
   return null;
+}
+
+async function authenticateCookieOrBearer(request: Request, env: Env): Promise<JwtPayload | null> {
+  const authorization = request.headers.get("Authorization");
+  const token = authorization?.startsWith("Bearer ")
+    ? authorization.slice("Bearer ".length).trim()
+    : parseCookie(request, "aio_token");
+  if (!token) return null;
+  const headers = new Headers(request.headers);
+  headers.set("Authorization", `Bearer ${token}`);
+  return authenticateRequest(new Request(request, { headers }), env);
 }
 async function handleRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
@@ -174,7 +313,7 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
     });
   }
   if (url.pathname === "/setup" && request.method === "POST") {
-    const gate = throttleByIp(request, 20, 15 * 60 * 1e3);
+    const gate = await throttleByIp(request, env, 20, 15 * 60 * 1e3);
     if (gate.blocked) return jsonError(429, "Too many requests");
     return handleCreateAccount(request, env);
   }
@@ -214,7 +353,8 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
     const tokenHash = await sha256Hex(parsed.token);
     // Ponytail: sticky failover state keyed by token hash; without this every
     // request replays the full failover sequence when the preferred host is down.
-    const saved = await env.AIO_KV.get<Partial<UserState>>(`st:${tokenHash}`, "json").catch(() => null);
+    const savedValue = await env.AIO_KV.get<JsonData>(`st:${tokenHash}`, "json").catch(() => null);
+    const saved = parsePersistedRoutingState(savedValue);
     const source: Source = token.s || "aiostreams";
     const state: UserState = {
       ...getDefaultUserState(env, source),
@@ -223,29 +363,32 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
       uuid: token.u,
       encryptedPassword: token.e || "",
       password: token.p,
-      preferredHost: token.h,
       currentHost: token.h,
       currentUuid: token.u,
       currentEncPwd: token.e || "",
       cachedConfig: token.c,
       enabledFallbackHosts: token.f,
       cacheRefreshHours: token.r || 48,
-      ...(saved || {}),
+      ...saved,
     };
     return await routeRequest(
       request,
       state,
       { uuid: token.u, encryptedPassword: token.e || "" },
-      (newState: UserState) =>
-        env.AIO_KV.put(
+      async (newState: UserState) => {
+        const latestValue = await env.AIO_KV.get<JsonData>(`st:${tokenHash}`, "json").catch(() => null);
+        const latest = parsePersistedRoutingState(latestValue);
+        return env.AIO_KV.put(
           `st:${tokenHash}`,
           JSON.stringify({
             source: newState.source,
             installationKey: tokenHash,
+            preferredHost: newState.preferredHost,
             currentHost: newState.currentHost,
             currentUuid: newState.currentUuid,
             currentEncPwd: newState.currentEncPwd,
-            failoverCount: newState.failoverCount,
+            enabledFallbackHosts: latest.enabledFallbackHosts || newState.enabledFallbackHosts,
+            cacheRefreshHours: latest.cacheRefreshHours ?? newState.cacheRefreshHours,
             lastFailoverAt: newState.lastFailoverAt,
             lastFailoverHost: newState.lastFailoverHost,
             lastPreferredCheck: newState.lastPreferredCheck,
@@ -254,7 +397,8 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
             validatedUuid: newState.validatedUuid,
             validatedEncPwd: newState.validatedEncPwd,
           }),
-        ),
+        );
+      },
       { get: () => getHostHealth(env), put: (health) => putHostHealth(env, health) },
       env,
       ctx,
@@ -312,28 +456,14 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
   );
 }
 async function handleDashboard(request: Request, env: Env): Promise<Response> {
-  const token = parseCookie(request, "aio_token");
-  if (!token) {
-    return Response.redirect(new URL("/", request.url), 302);
-  }
-  const key = await getSigningKey(env);
-  if (!key) {
-    return Response.redirect(new URL("/", request.url), 302);
-  }
-  const payload = await verifyJWT(token, key);
-  if (!payload) {
-    return Response.redirect(new URL("/", request.url), 302);
-  }
+  const payload = await authenticateCookieOrBearer(request, env);
+  if (!payload) return Response.redirect(new URL("/", request.url), 302);
   return new Response(dashboardPage(resolveHosts(env, "aiostreams"), resolveHosts(env, "aiometadata")), {
     headers: { "content-type": "text/html; charset=utf-8" },
   });
 }
 async function handleManageAccount(request: Request, env: Env, uuid: string): Promise<Response> {
-  const token = parseCookie(request, "aio_token");
-  if (!token) return Response.redirect(new URL("/", request.url), 302);
-  const key = await getSigningKey(env);
-  if (!key) return Response.redirect(new URL("/", request.url), 302);
-  const payload = await verifyJWT(token, key);
+  const payload = await authenticateCookieOrBearer(request, env);
   if (!payload) return Response.redirect(new URL("/", request.url), 302);
   const account = await getAccount(env, uuid);
   if (account?.token) {
@@ -348,7 +478,7 @@ async function handleAdmin(request: Request, env: Env): Promise<Response> {
     return handleLogin(request, env);
   }
   if (path === "/admin/logout" && request.method === "POST") {
-    return handleLogout();
+    return handleLogout(request, env);
   }
   const auth = await authenticateRequest(request, env);
   if (!auth) {
@@ -384,9 +514,23 @@ async function handleAdmin(request: Request, env: Env): Promise<Response> {
   return jsonError(404, "Admin endpoint not found");
 }
 function cookieHeader(token: string, maxAge: number): string {
-  return `aio_token=${token}; HttpOnly; Secure; Path=/dashboard; SameSite=Lax; Max-Age=${maxAge}`;
+  return `aio_token=${token}; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=${maxAge}`;
 }
-function handleLogout(): Response {
+async function handleLogout(request: Request, env: Env): Promise<Response> {
+  const authorization = request.headers.get("Authorization");
+  const token =
+    parseCookie(request, "aio_token") ||
+    (authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : "");
+  if (token) {
+    try {
+      await revokeJWTSession(env, token);
+    } catch (error) {
+      log("error", "Index", "JWT session revocation failed", {
+        error: errorMessage(error instanceof Error ? error : String(error)),
+      });
+      return jsonError(503, "Unable to revoke session");
+    }
+  }
   return new Response(null, {
     status: 200,
     headers: {
@@ -396,20 +540,16 @@ function handleLogout(): Response {
   });
 }
 async function handleLogin(request: Request, env: Env): Promise<Response> {
-  let body: JsonObject;
-  try {
-    const parsedBody: JsonData = await request.json();
-    if (!isRecord(parsedBody)) return jsonError(400, "Invalid JSON body");
-    body = parsedBody;
-  } catch {
-    return jsonError(400, "Invalid JSON body");
-  }
+  const parsedResult = await readJsonObjectWithLimit(request);
+  if (parsedResult.tooLarge) return jsonError(413, "Request body too large");
+  const body = parsedResult.body;
+  if (!body) return jsonError(400, "Invalid JSON body");
   const password = typeof body.password === "string" ? body.password : "";
   if (!password) return jsonError(400, "password is required");
   if (!env.ADMIN_PASSWORD) {
     return jsonError(401, "Invalid password");
   }
-  const gate = throttleByIp(request);
+  const gate = await throttleByIp(request, env);
   if (gate.blocked) {
     return new Response(JSON.stringify({ error: "Too many login attempts. Try again later." }), {
       status: 429,
@@ -420,7 +560,7 @@ async function handleLogin(request: Request, env: Env): Promise<Response> {
   if (!match) {
     return jsonError(401, "Invalid password");
   }
-  requestAttempts.delete(gate.ip);
+  await resetThrottle(env, gate.ip);
   const key = await getSigningKey(env);
   if (!key) return jsonError(500, "Signing key unavailable");
   const now = Math.floor(Date.now() / 1e3);
@@ -440,14 +580,10 @@ async function handleLogin(request: Request, env: Env): Promise<Response> {
   });
 }
 async function handleCreateAccount(request: Request, env: Env): Promise<Response> {
-  let body: JsonObject;
-  try {
-    const parsedBody: JsonData = await request.json();
-    if (!isRecord(parsedBody)) return jsonError(400, "Invalid JSON body");
-    body = parsedBody;
-  } catch {
-    return jsonError(400, "Invalid JSON body");
-  }
+  const parsedResult = await readJsonObjectWithLimit(request);
+  if (parsedResult.tooLarge) return jsonError(413, "Request body too large");
+  const body = parsedResult.body;
+  if (!body) return jsonError(400, "Invalid JSON body");
   const manifestUrl = typeof body.manifestUrl === "string" ? body.manifestUrl.trim() : "";
   const password = typeof body.password === "string" ? body.password : "";
   const enabledFallbackHosts = body.enabledFallbackHosts;
@@ -530,10 +666,11 @@ async function handleCreateAccount(request: Request, env: Env): Promise<Response
 }
 async function hydrateDashboardAccount(env: Env, account: AccountRecord): Promise<AccountRecord> {
   if (!account.token) return account;
-  const [token, saved] = await Promise.all([
+  const [token, savedValue] = await Promise.all([
     readStatelessToken(env, account.token),
-    env.AIO_KV.get(`st:${account.uuid}`, "json").catch(() => null),
+    env.AIO_KV.get<JsonData>(`st:${account.uuid}`, "json").catch(() => null),
   ]);
+  const saved = parsePersistedRoutingState(savedValue);
   return {
     ...account,
     source: token?.s || account.source || "aiostreams",
@@ -552,9 +689,23 @@ async function handleListAccounts(env: Env): Promise<Response> {
   });
 }
 async function handleDeleteAccount(env: Env, uuid: string): Promise<Response> {
+  const account = await getAccount(env, uuid);
+  if (account?.token) {
+    const payload = await readStatelessToken(env, account.token);
+    const tokenExpiry = "exp" in (payload || {}) && typeof payload?.exp === "number" ? payload.exp : undefined;
+    const tokenLineage = "l" in (payload || {}) && typeof payload?.l === "string" ? payload.l : undefined;
+    try {
+      if (tokenLineage) await revokeTokenLineage(env, tokenLineage, tokenExpiry);
+      await revokeStatelessToken(env, account.token, tokenExpiry);
+    } catch (error) {
+      log("error", "Index", "Account token revocation failed", {
+        uuid,
+        error: errorMessage(error instanceof Error ? error : String(error)),
+      });
+      return jsonError(503, "Unable to revoke account token");
+    }
+  }
   await deleteAccount(env, uuid);
-  // Revoke the stateless token: readStatelessToken rejects banned: hashes.
-  await Promise.all([env.AIO_KV.delete(`st:${uuid}`), env.AIO_KV.put(`banned:${uuid}`, "1")]);
   log("info", "Index", "Account deleted", { uuid });
   return new Response(null, { status: 204, headers: corsHeaders() });
 }
@@ -568,40 +719,50 @@ async function handleGetAccount(env: Env, uuid: string): Promise<Response> {
   });
 }
 async function handleUpdateAccount(request: Request, env: Env, uuid: string): Promise<Response> {
-  let body: JsonObject;
-  try {
-    const parsedBody: JsonData = await request.json();
-    if (!isRecord(parsedBody)) return jsonError(400, "Invalid JSON body");
-    body = parsedBody;
-  } catch {
-    return jsonError(400, "Invalid JSON body");
-  }
+  const parsedResult = await readJsonObjectWithLimit(request);
+  if (parsedResult.tooLarge) return jsonError(413, "Request body too large");
+  const body = parsedResult.body;
+  if (!body) return jsonError(400, "Invalid JSON body");
   const nickname = typeof body.nickname === "string" ? body.nickname : "";
   const cacheRefreshHours = typeof body.cacheRefreshHours === "number" ? body.cacheRefreshHours : undefined;
   const enabledFallbackHosts = body.enabledFallbackHosts;
   if (!nickname) return jsonError(400, "nickname is required");
   const existing = await getAccount(env, uuid);
   if (!existing) return jsonError(404, "Account not found");
+  const tokenPayload = existing.token ? await readStatelessToken(env, existing.token) : null;
+  const accountSource = tokenPayload?.s || existing.source || "aiostreams";
   const updated: AccountRecord = { ...existing, nickname };
   if (cacheRefreshHours !== undefined) {
     updated.cacheRefreshHours = Math.min(72, Math.max(1, Math.round(cacheRefreshHours)));
   }
+  let normalizedFallbacks: string[] | undefined;
   if (Array.isArray(enabledFallbackHosts)) {
     const normalized = normalizeUserHosts(enabledFallbackHosts);
-    if (normalized.length) {
-      try {
-        await verifySourceHosts(existing.source || "aiostreams", normalized);
-      } catch (err) {
-        return jsonError(
-          400,
-          "One or more fallback hosts do not support this source",
-          errorMessage(err instanceof Error ? err : String(err)),
-        );
-      }
-      updated.enabledFallbackHosts = normalized;
+    if (enabledFallbackHosts.length > 0 && normalized.length === 0)
+      return jsonError(400, "No valid fallback hosts supplied");
+    try {
+      await verifySourceHosts(accountSource, normalized);
+    } catch (err) {
+      return jsonError(
+        400,
+        "One or more fallback hosts do not support this source",
+        errorMessage(err instanceof Error ? err : String(err)),
+      );
     }
+    normalizedFallbacks = normalized;
+    updated.enabledFallbackHosts = normalized;
   }
   await putAccount(env, updated);
+  if (existing.token && (normalizedFallbacks || cacheRefreshHours !== undefined)) {
+    await env.AIO_KV.put(
+      `st:${uuid}`,
+      JSON.stringify({
+        ...(tokenPayload?.s ? { source: tokenPayload.s } : {}),
+        ...(normalizedFallbacks ? { enabledFallbackHosts: normalizedFallbacks } : {}),
+        ...(cacheRefreshHours !== undefined ? { cacheRefreshHours: updated.cacheRefreshHours } : {}),
+      }),
+    );
+  }
   log("info", "Index", "Account updated", { nickname, uuid });
   return new Response(JSON.stringify({ uuid, nickname }), {
     headers: { "content-type": "application/json", ...corsHeaders() },
@@ -616,7 +777,7 @@ async function handleScheduled(env: Env): Promise<void> {
   const results = await Promise.all(
     targets.map(async ({ source, host }): Promise<HostHealthEntry> => {
       const started = Date.now();
-      const online = await probe(host);
+      const online = await probe(host, source);
       const key = `${source}:${host}`;
       const previous = health[key] || health[host];
       return {
@@ -629,8 +790,21 @@ async function handleScheduled(env: Env): Promise<void> {
       };
     }),
   );
-  for (const result of results) health[`${result.source}:${result.host}`] = result;
-  await putHostHealth(env, health);
+  const healthStore: HealthStore = {
+    get: () => getHostHealth(env),
+    put: (value: HostHealth) => putHostHealth(env, value),
+  };
+  await Promise.all(
+    results.map(async (result) => {
+      try {
+        await updateHostHealth(healthStore, result.source || "aiostreams", result.host || "", result);
+      } catch (error) {
+        log("warn", "Index", "Scheduled health update failed", {
+          error: errorMessage(error instanceof Error ? error : String(error)),
+        });
+      }
+    }),
+  );
   log("info", "Index", "Host health refreshed", {
     healthy: results.filter((result) => result.status === "healthy").length,
     total: results.length,
@@ -643,21 +817,15 @@ type HealthResponse = {
   down: number;
   timestamp: number;
 };
-let healthCache: { data: HealthResponse | null; expires: number } = { data: null, expires: 0 };
 async function handleHealth(env: Env): Promise<Response> {
   const now = Date.now();
-  if (healthCache.data && healthCache.expires > now) {
-    return new Response(JSON.stringify(healthCache.data), {
-      headers: { "content-type": "application/json", ...corsHeaders() },
-    });
-  }
   const sources: Source[] = ["aiostreams", "aiometadata"];
   const targets: Array<{ source: Source; host: string }> = sources.flatMap((source) =>
     resolveHosts(env, source).map((host) => ({ source, host })),
   );
   const results = await Promise.allSettled(
     targets.map(async ({ source, host }) => {
-      const ok = await probe(host);
+      const ok = await probe(host, source);
       return { source, host, status: ok ? ("up" as const) : ("down" as const) };
     }),
   );
@@ -666,7 +834,6 @@ async function handleHealth(env: Env): Promise<Response> {
   );
   const up = hosts.filter((host) => host.status === "up").length;
   const data: HealthResponse = { hosts, total: hosts.length, up, down: hosts.length - up, timestamp: now };
-  healthCache = { data, expires: now + 3e4 };
   return new Response(JSON.stringify(data), {
     headers: { "content-type": "application/json", ...corsHeaders() },
   });

@@ -2,12 +2,17 @@
   "name": "aiostreams-streamkeeper",
   "private": true,
   "license": "GPL-3.0-only",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "types": "wrangler types worker-configuration.d.ts --include-runtime=false",
+    "lint:assets": "node src/ui/check-assets.mjs",
     "lint": "biome lint . && node scripts/check-type-escapes.mjs",
     "format:check": "biome ci --linter-enabled=false --assist-enabled=false .",
-    "check": "tsc --noEmit && npm run lint && npm run format:check"
+    "check": "tsc --noEmit && npm run lint && npm run lint:assets && npm run format:check"
   },
   "devDependencies": {
     "@biomejs/biome": "2.6.5",

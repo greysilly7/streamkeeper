@@ -13,8 +13,10 @@ npx wrangler secret put ADMIN_PASSWORD
 npx wrangler secret put PASSWORD_ENCRYPTION_KEY
 npm run deploy
 ```
+`AIOMETADATA_HOSTS` (optional) overrides the AIOMetadata fallback pool. Production failover coordination uses the `FAILOVER_COORDINATOR` Durable Object created by Wrangler's migration; local development falls back to best-effort in-memory coordination. Use Node.js 22 or newer.
 
-`ADMIN_PASSWORD` gates the dashboard; `PASSWORD_ENCRYPTION_KEY` seals install links and stored passwords. Set the encryption key once — rotating it invalidates every link you've distributed. `HOSTS` (optional) overrides the default instance pool.
+
+The Worker validates and bounds upstream response bodies, install-token lifetimes, admin sessions, and public JSON request bodies. Existing pre-expiry stateless links remain valid until their original revocation/rotation path; newly issued links expire automatically.
 
 ## Privacy
 

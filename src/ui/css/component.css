@@ -256,7 +256,9 @@
   pointer-events: none;
   visibility: hidden;
   opacity: 0;
-  transition: opacity var(--transition-base), visibility var(--transition-base);
+  transition:
+    opacity var(--transition-base),
+    visibility var(--transition-base);
   z-index: 100;
 }
 
